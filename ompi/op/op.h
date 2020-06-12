@@ -44,6 +44,11 @@
 #include "ompi/mpi/fortran/base/fint_2_int.h"
 #include "ompi/mca/op/op.h"
 
+#if OPAL_CUDA_SUPPORT
+#include "opal/datatype/opal_convertor.h"
+#include "opal/datatype/opal_datatype_cuda.h"
+#endif
+
 BEGIN_C_DECLS
 
 /**
@@ -544,6 +549,14 @@ static inline void ompi_op_reduce(ompi_op_t * op, void *source,
                                   void *target, int count,
                                   ompi_datatype_t * dtype)
 {
+
+#if OPAL_CUDA_SUPPORT
+    if (opal_cuda_check_bufs((char *) source, (char *) target))
+    {
+      return;
+    }
+#endif
+
     MPI_Fint f_dtype, f_count;
 
     /*
