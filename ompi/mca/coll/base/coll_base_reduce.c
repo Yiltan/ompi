@@ -113,7 +113,7 @@ int ompi_coll_base_reduce_generic( const void* sendbuf, void* recvbuf, int origi
 
         /* If this is a non-commutative operation we must copy
            sendbuf to the accumbuf, in order to simplfy the loops */
-        
+
         if (!ompi_op_is_commute(op) && MPI_IN_PLACE != sendbuf) {
             ompi_datatype_copy_content_same_ddt(datatype, original_count,
                                                 (char*)accumbuf,
@@ -605,6 +605,17 @@ int ompi_coll_base_reduce_intra_in_order_binary( const void *sendbuf, void *recv
  *  Accepts:    - same as MPI_Reduce()
  *  Returns:    - MPI_SUCCESS or error code
  */
+
+int is_malloced = 0;
+void * free_buffer_cuda;
+static inline void * my_cudaMalloc() {
+  if (!is_malloced) {
+    cudaMalloc(&free_buffer_cuda, ((size_t) 8 << (size_t) 25));
+    is_malloced = 1;
+  }
+  return free_buffer_cuda;
+}
+
 int
 ompi_coll_base_reduce_intra_basic_linear(const void *sbuf, void *rbuf, int count,
                                          struct ompi_datatype_t *dtype,
@@ -619,11 +630,14 @@ ompi_coll_base_reduce_intra_basic_linear(const void *sbuf, void *rbuf, int count
     char *pml_buffer = NULL;
     char *inplace_temp_free = NULL;
     char *inbuf;
+    int isCudaBuffer;
 
     /* Initialize */
 
     rank = ompi_comm_rank(comm);
     size = ompi_comm_size(comm);
+
+    isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
     /* If not root, send data to the root. */
 
@@ -647,14 +661,20 @@ ompi_coll_base_reduce_intra_basic_linear(const void *sbuf, void *rbuf, int count
     }
 
     if (size > 1) {
-        free_buffer = (char*)malloc(dsize);
+        if (isCudaBuffer)
+        {
+          pml_buffer = my_cudaMalloc();
+        } else {
+          free_buffer = (char*)malloc(dsize);
+          pml_buffer = free_buffer - gap;
+        }
+
         if (NULL == free_buffer) {
             if (NULL != inplace_temp_free) {
                 free(inplace_temp_free);
             }
             return OMPI_ERR_OUT_OF_RESOURCE;
         }
-        pml_buffer = free_buffer - gap;
     }
 
     /* Initialize the receive buffer. */
@@ -701,7 +721,7 @@ ompi_coll_base_reduce_intra_basic_linear(const void *sbuf, void *rbuf, int count
         err = ompi_datatype_copy_content_same_ddt(dtype, count, (char*)sbuf, rbuf);
         free(inplace_temp_free);
     }
-    if (NULL != free_buffer) {
+    if (NULL != free_buffer && !isCudaBuffer) {
         free(free_buffer);
     }
 
