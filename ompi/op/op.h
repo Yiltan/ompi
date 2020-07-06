@@ -45,6 +45,7 @@
 #include "ompi/mca/op/op.h"
 
 #include "kernel.h"
+#include "cuda_runtime.h"
 
 #include "opal/datatype/opal_convertor.h"
 #include "opal/datatype/opal_datatype_cuda.h"
@@ -552,7 +553,35 @@ static inline void ompi_op_reduce(ompi_op_t * op, void *source,
 
     if (opal_cuda_check_bufs((char *) source, (char *) target))
     {
-      vecAdd((float *) source, (float *) target, count);
+
+//#define YHT_DEBUG_OP
+#ifdef YHT_DEBUG_OP
+      size_t buff_size =  count * sizeof(float);
+      float* target_h = (float*) malloc(buff_size);
+      float* source_h = (float*) malloc(buff_size);
+      float* kernel_out_h = (float*) malloc(buff_size);
+
+      cudaMemcpy(target_h, target, buff_size, cudaMemcpyDeviceToHost);
+      cudaMemcpy(source_h, source, buff_size, cudaMemcpyDeviceToHost);
+
+      for (int i=0; i<count; i++) target_h[i] = target_h[i] + source_h[i];
+#endif
+
+      vecAdd((float *) target, (float *) source, count);
+
+#ifdef YHT_DEBUG_OP
+      cudaMemcpy(kernel_out_h, target, buff_size, cudaMemcpyDeviceToHost);
+
+      for (int i=0; i<count; i++) {
+        float diff = (target_h[i] - kernel_out_h[i]);
+        printf("op.h: diff[%f] = target_h[%f] - kernel_out_h[%f]\n",
+                 diff, target_h[i], kernel_out_h[i]);
+      }
+
+      free(target_h);
+      free(source_h);
+      free(kernel_out_h);
+#endif
       return;
     }
 
