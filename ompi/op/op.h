@@ -45,7 +45,10 @@
 #include "ompi/mca/op/op.h"
 
 #include "kernel.h"
+//#define YHT_DEBUG_OP
+#ifdef YHT_DEBUG_OP
 #include "cuda_runtime.h"
+#endif
 
 #include "opal/datatype/opal_convertor.h"
 #include "opal/datatype/opal_datatype_cuda.h"
@@ -554,7 +557,6 @@ static inline void ompi_op_reduce(ompi_op_t * op, void *source,
     if (opal_cuda_check_bufs((char *) source, (char *) target))
     {
 
-//#define YHT_DEBUG_OP
 #ifdef YHT_DEBUG_OP
       size_t buff_size =  count * sizeof(float);
       float* target_h = (float*) malloc(buff_size);
