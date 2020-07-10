@@ -613,6 +613,23 @@ ompi_coll_base_allreduce_intra_ring(const void *sbuf, void *rbuf, int count,
  *         in regular ring algorithm.
  *
  */
+
+int is_allreduce_malloced = 0;
+void * cuda_buff[2];
+
+// Buff size is 2M as that was profiled to be the largest
+// Segment Size which was used
+const size_t buff_size = ((size_t) 8 << (size_t) 18);
+
+static inline void * my_cudaMalloc(int n) {
+  if (!is_allreduce_malloced) {
+    cudaMalloc(&cuda_buff[0], buff_size);
+    cudaMalloc(&cuda_buff[1], buff_size);
+    is_allreduce_malloced = 1;
+  }
+  return cuda_buff[n];
+}
+
 int
 ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int count,
                                                struct ompi_datatype_t *dtype,
@@ -629,9 +646,12 @@ ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int 
     ptrdiff_t block_offset, max_real_segsize;
     ompi_request_t *reqs[2] = {NULL, NULL};
     ptrdiff_t lb, extent, gap;
+    int isCudaBuffer;
 
     size = ompi_comm_size(comm);
     rank = ompi_comm_rank(comm);
+
+    isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output,
                  "coll:base:allreduce_intra_ring_segmented rank %d, count %d", rank, count));
@@ -684,10 +704,14 @@ ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int 
      max_real_segsize = opal_datatype_span(&dtype->super, max_segcount, &gap);
 
     /* Allocate and initialize temporary buffers */
-    inbuf[0] = (char*)malloc(max_real_segsize);
+    inbuf[0] = isCudaBuffer
+             ? my_cudaMalloc(0)
+             : (char*)malloc(max_real_segsize);
     if (NULL == inbuf[0]) { ret = -1; line = __LINE__; goto error_hndl; }
     if (size > 2) {
-        inbuf[1] = (char*)malloc(max_real_segsize);
+        inbuf[1] = isCudaBuffer
+                 ? my_cudaMalloc(1)
+                 : (char*)malloc(max_real_segsize);
         if (NULL == inbuf[1]) { ret = -1; line = __LINE__; goto error_hndl; }
     }
 
@@ -839,8 +863,8 @@ ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int 
 
     }
 
-    if (NULL != inbuf[0]) free(inbuf[0]);
-    if (NULL != inbuf[1]) free(inbuf[1]);
+    if (NULL != inbuf[0] && !isCudaBuffer) free(inbuf[0]);
+    if (NULL != inbuf[1] && !isCudaBuffer) free(inbuf[1]);
 
     return MPI_SUCCESS;
 
@@ -848,8 +872,8 @@ ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int 
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output, "%s:%4d\tRank %d Error occurred %d\n",
                  __FILE__, line, rank, ret));
     (void)line;  // silence compiler warning
-    if (NULL != inbuf[0]) free(inbuf[0]);
-    if (NULL != inbuf[1]) free(inbuf[1]);
+    if (NULL != inbuf[0] && !isCudaBuffer) free(inbuf[0]);
+    if (NULL != inbuf[1] && !isCudaBuffer) free(inbuf[1]);
     return ret;
 }
 
