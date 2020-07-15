@@ -39,6 +39,31 @@
 #include "coll_base_topo.h"
 #include "coll_base_util.h"
 
+int is_allreduce_malloced = 0;
+void * cuda_buff[2];
+size_t pinned_gpu_buffer_size;
+
+static inline size_t get_pinned_gpu_buffer_size() {
+  char * env = getenv("PINNED_GPU_BUFFER_SIZE");
+
+  if (NULL == env) {
+    pinned_gpu_buffer_size = (size_t) ((size_t) 8 << (size_t) 21);
+  } else {
+    pinned_gpu_buffer_size = (size_t) atol(env);
+  }
+  return pinned_gpu_buffer_size;
+}
+
+static inline void * my_cudaMalloc(int n) {
+  if (!is_allreduce_malloced) {
+    cudaMalloc(&cuda_buff[0], get_pinned_gpu_buffer_size());
+    cudaMalloc(&cuda_buff[1], get_pinned_gpu_buffer_size());
+    is_allreduce_malloced = 1;
+  }
+  return cuda_buff[n];
+}
+
+
 /*
  * ompi_coll_base_allreduce_intra_nonoverlapping
  *
@@ -351,9 +376,11 @@ ompi_coll_base_allreduce_intra_ring(const void *sbuf, void *rbuf, int count,
     ptrdiff_t true_lb, true_extent, lb, extent;
     ptrdiff_t block_offset, max_real_segsize;
     ompi_request_t *reqs[2] = {NULL, NULL};
+    int isCudaBuffer;
 
     size = ompi_comm_size(comm);
     rank = ompi_comm_rank(comm);
+    isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output,
                  "coll:base:allreduce_intra_ring rank %d, count %d", rank, count));
@@ -397,10 +424,14 @@ ompi_coll_base_allreduce_intra_ring(const void *sbuf, void *rbuf, int count,
     max_real_segsize = true_extent + (max_segcount - 1) * extent;
 
 
-    inbuf[0] = (char*)malloc(max_real_segsize);
+    inbuf[0] = isCudaBuffer
+             ? my_cudaMalloc(0)
+             : (char*)malloc(max_real_segsize);
     if (NULL == inbuf[0]) { ret = -1; line = __LINE__; goto error_hndl; }
     if (size > 2) {
-        inbuf[1] = (char*)malloc(max_real_segsize);
+      inbuf[1] = isCudaBuffer
+               ? my_cudaMalloc(1)
+               : (char*)malloc(max_real_segsize);
         if (NULL == inbuf[1]) { ret = -1; line = __LINE__; goto error_hndl; }
     }
 
@@ -520,8 +551,8 @@ ompi_coll_base_allreduce_intra_ring(const void *sbuf, void *rbuf, int count,
 
     }
 
-    if (NULL != inbuf[0]) free(inbuf[0]);
-    if (NULL != inbuf[1]) free(inbuf[1]);
+    if (NULL != inbuf[0] && !isCudaBuffer) free(inbuf[0]);
+    if (NULL != inbuf[1] && !isCudaBuffer) free(inbuf[1]);
 
     return MPI_SUCCESS;
 
@@ -529,8 +560,8 @@ ompi_coll_base_allreduce_intra_ring(const void *sbuf, void *rbuf, int count,
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output, "%s:%4d\tRank %d Error occurred %d\n",
                  __FILE__, line, rank, ret));
     (void)line;  // silence compiler warning
-    if (NULL != inbuf[0]) free(inbuf[0]);
-    if (NULL != inbuf[1]) free(inbuf[1]);
+    if (NULL != inbuf[0] && !isCudaBuffer) free(inbuf[0]);
+    if (NULL != inbuf[1] && !isCudaBuffer) free(inbuf[1]);
     return ret;
 }
 
@@ -614,22 +645,6 @@ ompi_coll_base_allreduce_intra_ring(const void *sbuf, void *rbuf, int count,
  *
  */
 
-int is_allreduce_malloced = 0;
-void * cuda_buff[2];
-
-// Buff size is 2M as that was profiled to be the largest
-// Segment Size which was used
-const size_t buff_size = ((size_t) 8 << (size_t) 18);
-
-static inline void * my_cudaMalloc(int n) {
-  if (!is_allreduce_malloced) {
-    cudaMalloc(&cuda_buff[0], buff_size);
-    cudaMalloc(&cuda_buff[1], buff_size);
-    is_allreduce_malloced = 1;
-  }
-  return cuda_buff[n];
-}
-
 int
 ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int count,
                                                struct ompi_datatype_t *dtype,
@@ -647,9 +662,17 @@ ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int 
     ompi_request_t *reqs[2] = {NULL, NULL};
     ptrdiff_t lb, extent, gap;
     int isCudaBuffer;
+    size_t dtype_size;
 
     size = ompi_comm_size(comm);
     rank = ompi_comm_rank(comm);
+
+    ompi_datatype_type_size(dtype, &dtype_size);
+
+    // If message size is > 4MB, assuming floats
+    if (1024 * 1024 < count) {
+      segsize = (uint32_t) count * (uint32_t) ((int) dtype_size / 4);
+    }
 
     isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
