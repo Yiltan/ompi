@@ -38,6 +38,66 @@
 
 static const char FUNC_NAME[] = "MPI_Recv";
 
+#include "cuda_runtime.h"
+
+void *host_mem = NULL;
+static cudaStream_t d2h_stream = NULL;
+
+static inline void* get_host_mem() {
+    if (NULL == host_mem) {
+        size_t mem_size = 1024 * 1024 * 1024;
+        cudaMallocHost(&host_mem, mem_size);
+    }
+    return host_mem;
+}
+
+static inline cudaStream_t get_stream() {
+    if (NULL == d2h_stream) {
+      cudaStreamCreate(&d2h_stream);
+    }
+    return d2h_stream;
+}
+#include <sys/mman.h>
+#include <sys/stat.h>        /* For mode constants */
+#include <fcntl.h>           /* For O_* constants */
+#include <unistd.h>          /* For ftruncate() */
+
+static inline void* alloc_shared_mem(int count, int type_size, const char *name) {
+
+  int fd = shm_open(name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR );
+
+  int mem_size = type_size * count;
+  ftruncate(fd, mem_size);
+
+  void* ptr = NULL;
+  ptr = (void*) mmap(NULL, mem_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+  if (ptr==NULL) printf("mmap failed \n");
+  return ptr;
+}
+unsigned long long rtest = 0;
+
+int my_recv(void *buf, size_t count, struct ompi_datatype_t *type, int src,
+            int tag, struct ompi_communicator_t* comm,
+            ompi_status_public_t* status) {
+    MPI_Request request;
+    int ret = MPI_SUCCESS;
+    ret = MCA_PML_CALL(irecv(buf, count / 2, type, src, tag, comm, &request));
+
+    size_t type_size;
+    ompi_datatype_type_size(type, &type_size);
+
+    char str[256];
+    sprintf(str, "%llu-%d-%d-%d", rtest, tag, comm->c_my_rank, src);
+
+    void *ptr = alloc_shared_mem(count / 2, type_size, str);
+    cudaMemcpyAsync(buf, ptr, ((count * type_size) / 2), cudaMemcpyHostToDevice,
+                    get_stream());
+
+    ret = ompi_request_wait(&request, status);
+    cudaStreamWait(get_stream());
+    return ret;
+}
 
 int MPI_Recv(void *buf, int count, MPI_Datatype type, int source,
              int tag, MPI_Comm comm, MPI_Status *status)
@@ -79,6 +139,6 @@ int MPI_Recv(void *buf, int count, MPI_Datatype type, int source,
 
     OPAL_CR_ENTER_LIBRARY();
 
-    rc = MCA_PML_CALL(recv(buf, count, type, source, tag, comm, status));
+    rc = my_recv(buf, count, type, source, tag, comm, status);
     OMPI_ERRHANDLER_RETURN(rc, comm, rc, FUNC_NAME);
 }

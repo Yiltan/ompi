@@ -41,6 +41,61 @@
 
 static const char FUNC_NAME[] = "MPI_Send";
 
+#include <sys/mman.h>
+#include <sys/stat.h>        /* For mode constants */
+#include <fcntl.h>           /* For O_* constants */
+#include <unistd.h>          /* For ftruncate() */
+
+#include "cuda_runtime.h"
+
+static cudaStream_t d2h_stream = NULL;
+
+static inline cudaStream_t get_stream() {
+    if (NULL == d2h_stream) {
+      cudaStreamCreate(&d2h_stream);
+    }
+    return d2h_stream;
+}
+
+static inline void* alloc_shared_mem(int count, int type_size, const char *name) {
+
+  int fd = shm_open(name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR );
+
+  int mem_size = type_size * count;
+  ftruncate(fd, mem_size);
+
+  void* ptr = NULL;
+  ptr = (void*) mmap(NULL, mem_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+  if (ptr==NULL) printf("mmap failed \n");
+  return ptr;
+}
+
+unsigned long long test = 0;
+
+int my_send(const void *buf, int count, struct ompi_datatype_t *type, int dest,
+            int tag, mca_pml_base_send_mode_t mode,
+            struct ompi_communicator_t* comm) {
+
+    size_t type_size;
+    ompi_datatype_type_size(type, &type_size);
+
+    char str[256];
+    sprintf(str, "%llu-%d-%d-%d", test, tag, dest, comm->c_my_rank);
+    test++;
+    void *ptr = alloc_shared_mem(count / 2, type_size, str);
+    cudaMemcpyAsync(ptr, buf, ((count * type_size) / 2), cudaMemcpyDeviceToHost,
+                    get_stream());
+
+
+    MPI_Request request;
+    int ret = MPI_SUCCESS;
+    ret = MCA_PML_CALL(isend(buf, count / 2, type, dest, tag,
+                                MCA_PML_BASE_SEND_STANDARD, comm, &request));
+    ret = ompi_request_wait(&request, MPI_STATUS_IGNORE);
+    cudaStreamWait(get_stream());
+    return ret;
+}
 
 int MPI_Send(const void *buf, int count, MPI_Datatype type, int dest,
              int tag, MPI_Comm comm)
@@ -78,6 +133,6 @@ int MPI_Send(const void *buf, int count, MPI_Datatype type, int dest,
     }
 
     OPAL_CR_ENTER_LIBRARY();
-    rc = MCA_PML_CALL(send(buf, count, type, dest, tag, MCA_PML_BASE_SEND_STANDARD, comm));
+    rc = my_send(buf, count, type, dest, tag, MCA_PML_BASE_SEND_STANDARD, comm);
     OMPI_ERRHANDLER_RETURN(rc, comm, rc, FUNC_NAME);
 }
