@@ -41,6 +41,30 @@
 
 static const char FUNC_NAME[] = "MPI_Send";
 
+#include "cuda_ipc.h"
+int my_send(const void *buf, int count, struct ompi_datatype_t *type, int dest,
+                         int tag, mca_pml_base_send_mode_t mode,
+                         struct ompi_communicator_t* comm) {
+
+    int rc = MPI_SUCCESS;
+    if (1 || count < (1024 * 1024)) {
+      rc = MCA_PML_CALL(send(buf, count, type, dest, tag,
+                             MCA_PML_BASE_SEND_STANDARD, comm));
+      return rc;
+    }
+
+    size_t type_size;
+    ompi_datatype_type_size(type, &type_size);
+
+    //multi_send((char *) buf, (count * type_size));
+
+    /*
+    rc = MCA_PML_CALL(send(buf, count, type, dest, tag,
+                           MCA_PML_BASE_SEND_STANDARD, comm));
+    */
+    return rc;
+}
+
 
 int MPI_Send(const void *buf, int count, MPI_Datatype type, int dest,
              int tag, MPI_Comm comm)
@@ -78,6 +102,6 @@ int MPI_Send(const void *buf, int count, MPI_Datatype type, int dest,
     }
 
     OPAL_CR_ENTER_LIBRARY();
-    rc = MCA_PML_CALL(send(buf, count, type, dest, tag, MCA_PML_BASE_SEND_STANDARD, comm));
+    rc = my_send(buf, count, type, dest, tag, MCA_PML_BASE_SEND_STANDARD, comm);
     OMPI_ERRHANDLER_RETURN(rc, comm, rc, FUNC_NAME);
 }

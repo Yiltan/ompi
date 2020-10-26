@@ -38,6 +38,29 @@
 
 static const char FUNC_NAME[] = "MPI_Recv";
 
+#include "cuda_ipc.h"
+
+int my_recv(void *buf, int count, struct ompi_datatype_t *type, int source,
+            int tag, struct ompi_communicator_t* comm,
+            struct ompi_status_public_t *status) {
+
+    int rc = MPI_SUCCESS;
+
+    if (1 || count < (1024 * 1024)) {
+      rc = MCA_PML_CALL(recv(buf, count, type, source, tag, comm, status));
+      return rc;
+    }
+
+    size_t type_size;
+    ompi_datatype_type_size(type, &type_size);
+
+    //multi_recv((char*) buf, source, (count * type_size));
+    /*
+       rc = MCA_PML_CALL(recv(buf, count, type, source, tag, comm, status));
+       */
+    return rc;
+}
+
 
 int MPI_Recv(void *buf, int count, MPI_Datatype type, int source,
              int tag, MPI_Comm comm, MPI_Status *status)
@@ -79,6 +102,6 @@ int MPI_Recv(void *buf, int count, MPI_Datatype type, int source,
 
     OPAL_CR_ENTER_LIBRARY();
 
-    rc = MCA_PML_CALL(recv(buf, count, type, source, tag, comm, status));
+    rc = my_recv(buf, count, type, source, tag, comm, status);
     OMPI_ERRHANDLER_RETURN(rc, comm, rc, FUNC_NAME);
 }
