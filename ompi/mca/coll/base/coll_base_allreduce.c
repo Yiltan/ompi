@@ -163,9 +163,11 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
     int newrank, newremote, extra_ranks;
     char *tmpsend = NULL, *tmprecv = NULL, *tmpswap = NULL, *inplacebuf_free = NULL, *inplacebuf;
     ptrdiff_t span, gap = 0;
+    int isCudaBuffer;
 
     size = ompi_comm_size(comm);
     rank = ompi_comm_rank(comm);
+    isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output,
                  "coll:base:allreduce_intra_recursivedoubling rank %d", rank));
@@ -181,7 +183,10 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
 
     /* Allocate and initialize temporary send buffer */
     span = opal_datatype_span(&dtype->super, count, &gap);
-    inplacebuf_free = (char*) malloc(span);
+    inplacebuf_free = isCudaBuffer
+                    ? my_cudaMalloc(0)
+                    : (char*)malloc(span);
+
     if (NULL == inplacebuf_free) { ret = -1; line = __LINE__; goto error_hndl; }
     inplacebuf = inplacebuf_free - gap;
 
@@ -287,14 +292,14 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
         if (ret < 0) { line = __LINE__; goto error_hndl; }
     }
 
-    if (NULL != inplacebuf_free) free(inplacebuf_free);
+    if (NULL != inplacebuf_free && !isCudaBuffer) free(inplacebuf_free);
     return MPI_SUCCESS;
 
  error_hndl:
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output, "%s:%4d\tRank %d Error occurred %d\n",
                  __FILE__, line, rank, ret));
     (void)line;  // silence compiler warning
-    if (NULL != inplacebuf_free) free(inplacebuf_free);
+    if (NULL != inplacebuf_free && !isCudaBuffer) free(inplacebuf_free);
     return ret;
 }
 
