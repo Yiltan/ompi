@@ -33,6 +33,52 @@
 #include "ompi/op/op.h"
 #include "coll_tuned.h"
 
+#define NUM_GPUS 4
+
+int comms_initialised = 0;
+
+struct ompi_communicator_t* intra_comm;
+struct ompi_communicator_t* gpu_group_comm;
+
+struct ompi_communicator_t* comm_cache;
+
+static inline void init_comms(struct ompi_communicator_t* original_comm) {
+  if (comm_cache != original_comm) {
+    comm_cache = original_comm;
+
+    int key = original_comm->c_my_rank;
+    int color;
+
+    // Get Intra comm
+    char name[MPI_MAX_PROCESSOR_NAME];
+    int resultlen;
+    MPI_Get_processor_name(name, &resultlen);
+
+    ompi_comm_split(original_comm, (int) name, key,
+                    &intra_comm, false);
+
+    // Get GPU group
+    int device;
+    cudaGetDevice(&device);
+    ompi_comm_split(original_comm, device, key,
+                    &gpu_group_comm, false);
+
+    // Test
+    printf("World Rank %d, GPU Rank %d, Intra Comm Rank %d\n",
+           original_comm->c_my_rank,
+           gpu_group_comm->c_my_rank,
+           intra_comm->c_my_rank);
+
+
+  }
+}
+
+
+
+
+
+
+
 /*
  *  allreduce_intra
  *
@@ -51,6 +97,8 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
     int comm_size = ompi_comm_size(comm);
     const size_t intermediate_message = 10000;
     OPAL_OUTPUT((ompi_coll_tuned_stream, "ompi_coll_tuned_allreduce_intra_dec_fixed"));
+
+    init_comms(comm);
 
     /**
      * Decision function based on MX results from the Grig cluster at UTK.
