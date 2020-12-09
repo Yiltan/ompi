@@ -37,6 +37,34 @@
 #include "opal/class/opal_list.h"
 #include "opal/mca/base/base.h"
 
+#include "cuda_runtime.h"
+
+extern void * cuda_buff[2];
+
+static int is_allreduce_malloced = 0;
+static size_t pinned_gpu_buffer_size;
+
+static inline size_t get_pinned_gpu_buffer_size() {
+  char * env = getenv("PINNED_GPU_BUFFER_SIZE");
+
+  if (NULL == env) {
+    pinned_gpu_buffer_size = (size_t) ((size_t) 8 << (size_t) 21);
+  } else {
+    pinned_gpu_buffer_size = (size_t) atol(env);
+  }
+  return pinned_gpu_buffer_size;
+}
+
+static inline void * my_cudaMalloc(int n) {
+  if (!is_allreduce_malloced) {
+    cudaMalloc(&cuda_buff[0], get_pinned_gpu_buffer_size());
+    cudaMalloc(&cuda_buff[1], get_pinned_gpu_buffer_size());
+    is_allreduce_malloced = 1;
+  }
+  return cuda_buff[n];
+}
+
+
 /*
  * Global functions for MCA overall collective open and close
  */

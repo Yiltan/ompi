@@ -39,30 +39,7 @@
 #include "coll_base_topo.h"
 #include "coll_base_util.h"
 
-int is_allreduce_malloced = 0;
 void * cuda_buff[2];
-size_t pinned_gpu_buffer_size;
-
-static inline size_t get_pinned_gpu_buffer_size() {
-  char * env = getenv("PINNED_GPU_BUFFER_SIZE");
-
-  if (NULL == env) {
-    pinned_gpu_buffer_size = (size_t) ((size_t) 8 << (size_t) 21);
-  } else {
-    pinned_gpu_buffer_size = (size_t) atol(env);
-  }
-  return pinned_gpu_buffer_size;
-}
-
-static inline void * my_cudaMalloc(int n) {
-  if (!is_allreduce_malloced) {
-    cudaMalloc(&cuda_buff[0], get_pinned_gpu_buffer_size());
-    cudaMalloc(&cuda_buff[1], get_pinned_gpu_buffer_size());
-    is_allreduce_malloced = 1;
-  }
-  return cuda_buff[n];
-}
-
 
 /*
  * ompi_coll_base_allreduce_intra_nonoverlapping
@@ -185,8 +162,7 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
     span = opal_datatype_span(&dtype->super, count, &gap);
     inplacebuf_free = isCudaBuffer
                     ? my_cudaMalloc(0)
-                    : (char*)malloc(span);
-
+                    : (char*) malloc(span);
     if (NULL == inplacebuf_free) { ret = -1; line = __LINE__; goto error_hndl; }
     inplacebuf = inplacebuf_free - gap;
 
@@ -1029,6 +1005,7 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output,
                  "coll:base:allreduce_intra_redscat_allgather: rank %d/%d",
                  rank, comm_size));
+    int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
     /* Find nearest power-of-two less than or equal to comm_size */
     int nsteps = opal_hibit(comm_size, comm->c_cube_dim + 1);   /* ilog2(comm_size) */
@@ -1051,7 +1028,9 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
 
     /* Temporary buffer for receiving messages */
     char *tmp_buf = NULL;
-    char *tmp_buf_raw = (char *)malloc(dsize);
+    char *tmp_buf_raw = isCudaBuffer
+                      ? (char*) my_cudaMalloc(0)
+                      : (char*) malloc(dsize);
     if (NULL == tmp_buf_raw)
         return OMPI_ERR_OUT_OF_RESOURCE;
     tmp_buf = tmp_buf_raw - gap;
@@ -1279,7 +1258,7 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
     }
 
   cleanup_and_return:
-    if (NULL != tmp_buf_raw)
+    if (NULL != tmp_buf_raw && !isCudaBuffer)
         free(tmp_buf_raw);
     if (NULL != rindex)
         free(rindex);
