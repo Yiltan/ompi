@@ -25,6 +25,7 @@
 #include "ompi_config.h"
 
 #include "mpi.h"
+#include "cuda_runtime.h"
 #include "opal/util/bit_ops.h"
 #include "ompi/datatype/ompi_datatype.h"
 #include "ompi/communicator/communicator.h"
@@ -36,48 +37,117 @@
 #define NUM_GPUS 4
 
 int comms_initialised = 0;
+int use_hierarchical_allreduce = 0;
+int intra_algo = 0;
+int inter_algo = 0;
 
 struct ompi_communicator_t* intra_comm;
 struct ompi_communicator_t* gpu_group_comm;
 
 struct ompi_communicator_t* comm_cache;
 
-static inline void init_comms(struct ompi_communicator_t* original_comm) {
-  if (comm_cache != original_comm) {
-    comm_cache = original_comm;
+// This is a hash function from: http://www.cse.yorku.ca/~oz/hash.html
+static inline int hash(char *input, int len) {
+    unsigned char *str = (unsigned char *) input;
+    unsigned long hash = 5381;
+    int c;
 
-    int key = original_comm->c_my_rank;
-    int color;
+    while (c = *str++) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+        len = len - 1;
+    }
 
-    // Get Intra comm
-    char name[MPI_MAX_PROCESSOR_NAME];
-    int resultlen;
-    MPI_Get_processor_name(name, &resultlen);
-
-    ompi_comm_split(original_comm, (int) name, key,
-                    &intra_comm, false);
-
-    // Get GPU group
-    int device;
-    cudaGetDevice(&device);
-    ompi_comm_split(original_comm, device, key,
-                    &gpu_group_comm, false);
-
-    // Test
-    printf("World Rank %d, GPU Rank %d, Intra Comm Rank %d\n",
-           original_comm->c_my_rank,
-           gpu_group_comm->c_my_rank,
-           intra_comm->c_my_rank);
-
-
-  }
+    return abs((int) hash);
 }
 
+static inline void init_comms(struct ompi_communicator_t* original_comm) {
+    if (comm_cache != original_comm) {
+        comm_cache = original_comm;
+
+        int key = original_comm->c_my_rank;
+        int color;
+
+        // Get Intra comm
+        char name[MPI_MAX_PROCESSOR_NAME];
+        int resultlen;
+        MPI_Get_processor_name(name, &resultlen);
+
+        printf("Name %s -> %d\n", name, hash(name, resultlen));
+
+        ompi_comm_split(original_comm, hash(name, resultlen), key,
+                        &intra_comm, false);
+
+        // Get GPU group
+        int device;
+        cudaGetDevice(&device);
+        ompi_comm_split(original_comm, device, key,
+                        &gpu_group_comm, false);
+
+        // Test
+        printf("World Rank %d, GPU Rank %d, Intra Comm Rank %d\n",
+               original_comm->c_my_rank,
+               gpu_group_comm->c_my_rank,
+               intra_comm->c_my_rank);
 
 
+        char *env = getenv("USE_HIERARCHICAL_ALLREDUCE");
+        if (NULL != env) {
+          use_hierarchical_allreduce = atoi(env);
+        }
 
+        env = getenv("ALLREDUCE_INTRA_ALGO");
+        if (NULL != env) {
+          intra_algo = atoi(env);
+        }
 
+        env = getenv("ALLREDUCE_INTER_ALGO");
+        if (NULL != env) {
+          inter_algo = atoi(env);
+        }
+    }
+}
 
+#define ALLREDUCE_INTRA_NONOVERLAPPING    0
+#define ALLREDUCE_INTRA_RECURSIVEDOUBLING 1
+#define ALLREDUCE_INTRA_RING              2
+#define ALLREDUCE_INTRA_RING_SEGMENTED    3
+#define ALLREDUCE_INTRA_BASIC_LINEAR      4
+#define ALLREDUCE_INTRA_REDSCAT_ALLGATHER 5
+
+int allreduce_switch(const void *sbuf, void *rbuf, int count,
+                     struct ompi_datatype_t *dtype,
+                     struct ompi_op_t *op,
+                     struct ompi_communicator_t *comm,
+                     mca_coll_base_module_t *module,
+                     uint32_t segsize,
+                     int coll_num) {
+  switch (coll_num) {
+    case ALLREDUCE_INTRA_NONOVERLAPPING:
+      return ompi_coll_base_allreduce_intra_nonoverlapping(sbuf, rbuf, count,
+                                                           dtype, op, comm, module);
+      break;
+    case ALLREDUCE_INTRA_RECURSIVEDOUBLING:
+      return ompi_coll_base_allreduce_intra_recursivedoubling(sbuf, rbuf, count,
+                                                              dtype, op, comm, module);
+      break;
+    case ALLREDUCE_INTRA_RING:
+      return ompi_coll_base_allreduce_intra_ring(sbuf, rbuf, count, dtype, op, comm, module);
+      break;
+    case ALLREDUCE_INTRA_RING_SEGMENTED:
+      return ompi_coll_base_allreduce_intra_ring_segmented(sbuf, rbuf, count,
+                                                           dtype, op, comm, module, segsize);
+      break;
+    case ALLREDUCE_INTRA_BASIC_LINEAR:
+      return ompi_coll_base_allreduce_intra_basic_linear(sbuf, rbuf, count,
+                                                         dtype, op, comm, module);
+      break;
+    case ALLREDUCE_INTRA_REDSCAT_ALLGATHER:
+    default:
+      return ompi_coll_base_allreduce_intra_redscat_allgather(sbuf, rbuf, count,
+                                                              dtype, op, comm, module);
+      break;
+  }
+}
 
 /*
  *  allreduce_intra
@@ -100,37 +170,53 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
 
     init_comms(comm);
 
-    /**
-     * Decision function based on MX results from the Grig cluster at UTK.
-     *
-     * Currently, linear, recursive doubling, and nonoverlapping algorithms
-     * can handle both commutative and non-commutative operations.
-     * Ring algorithm does not support non-commutative operations.
-     */
     ompi_datatype_type_size(dtype, &dsize);
     block_dsize = dsize * (ptrdiff_t)count;
 
-    if (block_dsize < intermediate_message) {
-        return (ompi_coll_base_allreduce_intra_recursivedoubling(sbuf, rbuf,
-                                                                 count, dtype,
-                                                                 op, comm, module));
-    }
-
-    if( ompi_op_is_commute(op) && (count > comm_size) ) {
-        const size_t segment_size = 1 << 20; /* 1 MB */
-        if (((size_t)comm_size * (size_t)segment_size >= block_dsize)) {
-            return (ompi_coll_base_allreduce_intra_ring(sbuf, rbuf, count, dtype,
-                                                        op, comm, module));
-        } else {
-            return (ompi_coll_base_allreduce_intra_ring_segmented(sbuf, rbuf,
-                                                                  count, dtype,
-                                                                  op, comm, module,
-                                                                  segment_size));
+    // If single node (assuming 4 PPN) or using a flat algo
+    // then use original algo.
+    // This can be optimized later for single node if needed.
+    const size_t segment_size = 1 << 20; /* 1 MB */
+    if (comm_size == ompi_comm_size(intra_comm) &&
+        0 == use_hierarchical_allreduce) {
+        if (block_dsize < intermediate_message) {
+            return (ompi_coll_base_allreduce_intra_recursivedoubling(sbuf, rbuf,
+                                                                     count, dtype,
+                                                                     op, comm,
+                                                                     module));
         }
-    }
 
-    return (ompi_coll_base_allreduce_intra_nonoverlapping(sbuf, rbuf, count,
-                                                          dtype, op, comm, module));
+        if( ompi_op_is_commute(op) && (count > comm_size) ) {
+            if (((size_t)comm_size * (size_t)segment_size >= block_dsize)) {
+                return (ompi_coll_base_allreduce_intra_ring(sbuf, rbuf, count,
+                                                            dtype, op, comm,
+                                                            module));
+            } else {
+                return (ompi_coll_base_allreduce_intra_ring_segmented(sbuf, rbuf,
+                                                                      count, dtype,
+                                                                      op, comm,
+                                                                      module,
+                                                                      segment_size));
+            }
+        }
+
+        return (ompi_coll_base_allreduce_intra_nonoverlapping(sbuf, rbuf, count,
+                                                              dtype, op, comm,
+                                                              module));
+    } else if (1 == use_hierarchical_allreduce) {
+        int ret_val = MPI_SUCCESS;
+        ret_val = (allreduce_switch(sbuf, rbuf, count, dtype, op, gpu_group_comm,
+                                    module, segment_size, inter_algo));
+
+        ret_val &= (allreduce_switch(MPI_IN_PLACE, rbuf, count, dtype, op,
+                                     intra_comm, module, segment_size, intra_algo));
+        return ret_val;
+    } else if (2 == use_hierarchical_allreduce) {
+        return (allreduce_switch(sbuf, rbuf, count, dtype, op,
+                                 comm, module, segment_size, intra_algo));
+    } else {
+        return -1;
+    }
 }
 
 /*
