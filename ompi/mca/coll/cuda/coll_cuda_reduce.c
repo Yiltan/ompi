@@ -19,6 +19,21 @@
 #include "opal/datatype/opal_convertor.h"
 #include "opal/datatype/opal_datatype_cuda.h"
 
+static int ucx_aware_status = -1;
+static inline int is_ucx_aware() {
+  if (ucx_aware_status == -1) {
+    char* env = getenv("IS_UCX_AWARE");
+
+    if (NULL == env) {
+      *env = '0';
+    }
+
+    ucx_aware_status = atoi(env);
+  }
+  return ucx_aware_status;
+}
+
+
 /*
  *	reduce_log_inter
  *
@@ -41,6 +56,13 @@ mca_coll_cuda_reduce(const void *sbuf, void *rbuf, int count,
     int rc;
 
     bufsize = opal_datatype_span(&dtype->super, count, &gap);
+    if (is_ucx_aware() && OMPI_OP_SUM == op->op_type) {
+        return s->c_coll.coll_reduce((void *) sbuf, rbuf, count,
+                                     dtype, op, root, comm,
+                                     s->c_coll.coll_reduce_module);
+
+    }
+
 
 
     if ((MPI_IN_PLACE != sbuf) && (opal_cuda_check_bufs((char *)sbuf, NULL))) {

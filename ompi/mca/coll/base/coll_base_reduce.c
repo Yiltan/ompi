@@ -76,6 +76,9 @@ int ompi_coll_base_reduce_generic( const void* sendbuf, void* recvbuf, int origi
   int num_segments, line, ret, segindex, i, rank;
   int recvcount, prevcount, inbi;
 
+  int isCudaBuffer;
+  isCudaBuffer = opal_cuda_check_bufs((char *) sendbuf, (char *) recvbuf);
+
   /**
    * Determine number of segments and number of elements
    * sent per operation
@@ -106,7 +109,9 @@ int ompi_coll_base_reduce_generic( const void* sendbuf, void* recvbuf, int origi
       if( (NULL == accumbuf) || (root != rank) ) {
           /* Allocate temporary accumulator buffer. */
           size = opal_datatype_span(&datatype->super, original_count, &gap);
-          accumbuf_free = (char*)malloc(size);
+          accumbuf_free = isCudaBuffer
+                        ? my_cudaMalloc(0)
+                        : (char*)malloc(size);
           if (accumbuf_free == NULL) {
               line = __LINE__; ret = -1; goto error_hndl;
           }
@@ -123,7 +128,9 @@ int ompi_coll_base_reduce_generic( const void* sendbuf, void* recvbuf, int origi
       }
       /* Allocate two buffers for incoming segments */
       real_segment_size = opal_datatype_span(&datatype->super, count_by_segment, &gap);
-      inbuf_free[0] = (char*) malloc(real_segment_size);
+      inbuf_free[0] = isCudaBuffer
+                    ? my_cudaMalloc(0)
+                    : (char*) malloc(real_segment_size);
       if( inbuf_free[0] == NULL ) {
           line = __LINE__; ret = -1; goto error_hndl;
       }
@@ -131,7 +138,9 @@ int ompi_coll_base_reduce_generic( const void* sendbuf, void* recvbuf, int origi
       /* if there is chance to overlap communication -
          allocate second buffer */
       if( (num_segments > 1) || (tree->tree_nextsize > 1) ) {
-          inbuf_free[1] = (char*) malloc(real_segment_size);
+          inbuf_free[1] = isCudaBuffer
+                        ? my_cudaMalloc(1)
+                        : (char*) malloc(real_segment_size);
           if( inbuf_free[1] == NULL ) {
               line = __LINE__; ret = -1; goto error_hndl;
           }
@@ -242,9 +251,9 @@ int ompi_coll_base_reduce_generic( const void* sendbuf, void* recvbuf, int origi
       } /* end of for each segment */
 
       /* clean up */
-      if( inbuf_free[0] != NULL) free(inbuf_free[0]);
-      if( inbuf_free[1] != NULL) free(inbuf_free[1]);
-      if( accumbuf_free != NULL ) free(accumbuf_free);
+      if( inbuf_free[0] != NULL && !isCudaBuffer) free(inbuf_free[0]);
+      if( inbuf_free[1] != NULL && !isCudaBuffer) free(inbuf_free[1]);
+      if( accumbuf_free != NULL && !isCudaBuffer) free(accumbuf_free);
   }
 
   /* leaf nodes
@@ -344,9 +353,9 @@ error_hndl:  /* error handler */
                 "ERROR_HNDL: node %d file %s line %d error %d\n",
                 rank, __FILE__, line, ret ));
   (void)line;  // silence compiler warning
-  if( inbuf_free[0] != NULL ) free(inbuf_free[0]);
-  if( inbuf_free[1] != NULL ) free(inbuf_free[1]);
-  if( accumbuf_free != NULL ) free(accumbuf);
+  if( inbuf_free[0] != NULL && !isCudaBuffer) free(inbuf_free[0]);
+  if( inbuf_free[1] != NULL && !isCudaBuffer) free(inbuf_free[1]);
+  if( accumbuf_free != NULL && !isCudaBuffer) free(accumbuf);
   if( NULL != sreq ) {
       ompi_coll_base_free_reqs(sreq, max_outstanding_reqs);
   }
@@ -372,6 +381,10 @@ int ompi_coll_base_reduce_intra_chain( const void *sendbuf, void *recvbuf, int c
   size_t typelng;
   mca_coll_base_module_t *base_module = (mca_coll_base_module_t*) module;
   mca_coll_base_comm_t *data = base_module->base_data;
+
+  int isCudaBuffer;
+  isCudaBuffer = opal_cuda_check_bufs((char *) sendbuf, (char *) recvbuf);
+
 
   OPAL_OUTPUT((ompi_coll_base_framework.framework_output,"coll:base:reduce_intra_chain rank %d fo %d ss %5d", ompi_comm_rank(comm), fanout, segsize));
 
@@ -402,6 +415,10 @@ int ompi_coll_base_reduce_intra_pipeline( const void *sendbuf, void *recvbuf,
   size_t typelng;
   mca_coll_base_module_t *base_module = (mca_coll_base_module_t*) module;
   mca_coll_base_comm_t *data = base_module->base_data;
+
+  int isCudaBuffer;
+  isCudaBuffer = opal_cuda_check_bufs((char *) sendbuf, (char *) recvbuf);
+
 
   OPAL_OUTPUT((ompi_coll_base_framework.framework_output,"coll:base:reduce_intra_pipeline rank %d ss %5d",
                ompi_comm_rank(comm), segsize));
@@ -465,6 +482,9 @@ int ompi_coll_base_reduce_intra_binomial( const void *sendbuf, void *recvbuf,
   mca_coll_base_module_t *base_module = (mca_coll_base_module_t*) module;
   mca_coll_base_comm_t *data = base_module->base_data;
 
+  int isCudaBuffer;
+  isCudaBuffer = opal_cuda_check_bufs((char *) sendbuf, (char *) recvbuf);
+
   OPAL_OUTPUT((ompi_coll_base_framework.framework_output,"coll:base:reduce_intra_binomial rank %d ss %5d",
                ompi_comm_rank(comm), segsize));
 
@@ -506,6 +526,9 @@ int ompi_coll_base_reduce_intra_in_order_binary( const void *sendbuf, void *recv
   size_t typelng;
   mca_coll_base_module_t *base_module = (mca_coll_base_module_t*) module;
   mca_coll_base_comm_t *data = base_module->base_data;
+
+  int isCudaBuffer;
+  isCudaBuffer = opal_cuda_check_bufs((char *) sendbuf, (char *) recvbuf);
 
   rank = ompi_comm_rank(comm);
   size = ompi_comm_size(comm);
@@ -637,6 +660,7 @@ ompi_coll_base_reduce_intra_basic_linear(const void *sbuf, void *rbuf, int count
                               MCA_PML_BASE_SEND_STANDARD, comm));
       return err;
   }
+
 
   dsize = opal_datatype_span(&dtype->super, count, &gap);
   ompi_datatype_type_extent(dtype, &extent);
@@ -788,6 +812,8 @@ int ompi_coll_base_reduce_intra_redscat_gather(
 {
   int comm_size = ompi_comm_size(comm);
   int rank = ompi_comm_rank(comm);
+  int isCudaBuffer;
+  isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
   OPAL_OUTPUT((ompi_coll_base_framework.framework_output,
                "coll:base:reduce_intra_redscat_gather: rank %d/%d, root %d",
