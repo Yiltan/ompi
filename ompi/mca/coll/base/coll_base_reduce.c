@@ -419,7 +419,6 @@ int ompi_coll_base_reduce_intra_pipeline( const void *sendbuf, void *recvbuf,
   int isCudaBuffer;
   isCudaBuffer = opal_cuda_check_bufs((char *) sendbuf, (char *) recvbuf);
 
-
   OPAL_OUTPUT((ompi_coll_base_framework.framework_output,"coll:base:reduce_intra_pipeline rank %d ss %5d",
                ompi_comm_rank(comm), segsize));
 
@@ -660,7 +659,6 @@ ompi_coll_base_reduce_intra_basic_linear(const void *sbuf, void *rbuf, int count
                               MCA_PML_BASE_SEND_STANDARD, comm));
       return err;
   }
-
 
   dsize = opal_datatype_span(&dtype->super, count, &gap);
   ompi_datatype_type_extent(dtype, &extent);

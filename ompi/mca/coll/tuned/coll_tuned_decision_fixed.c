@@ -75,6 +75,7 @@ static inline void init_comms(struct ompi_communicator_t* original_comm) {
         int resultlen;
         MPI_Get_processor_name(name, &resultlen);
 
+<<<<<<< HEAD
         ompi_comm_split(original_comm, hash(name, resultlen), key,
                         &intra_comm, false);
 
@@ -91,6 +92,24 @@ static inline void init_comms(struct ompi_communicator_t* original_comm) {
         }
 
         // Test
+=======
+        printf("Name %s -> %d\n", name, hash(name, resultlen));
+
+        ompi_comm_split(original_comm, hash(name, resultlen), key,
+                        &intra_comm, false);
+
+        // Get GPU group
+        int device;
+        cudaGetDevice(&device);
+        ompi_comm_split(original_comm, device, key,
+                        &gpu_group_comm, false);
+
+        // Test
+        printf("World Rank %d, GPU Rank %d, Intra Comm Rank %d\n",
+               original_comm->c_my_rank,
+               gpu_group_comm->c_my_rank,
+               intra_comm->c_my_rank);
+
 
         char *env = getenv("USE_HIERARCHICAL_ALLREDUCE");
         if (NULL != env) {
@@ -250,7 +269,7 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
     // then use original algo.
     // This can be optimized later for single node if needed.
     const size_t segment_size = 1 << 20; /* 1 MB */
-    if (comm_size == ompi_comm_size(intra_comm) ||
+    if (comm_size == ompi_comm_size(intra_comm) &&
         0 == use_hierarchical_allreduce) {
         if (block_dsize < intermediate_message) {
             return (ompi_coll_base_allreduce_intra_recursivedoubling(sbuf, rbuf,
