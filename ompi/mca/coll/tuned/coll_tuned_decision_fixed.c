@@ -39,7 +39,7 @@
 int comms_initialised = 0;
 int use_hierarchical_allreduce = 0;
 int intra_allreduce_algo = 0;
-int intra_reduce_algo = 0;
+int intra_reduce_algo = -1;
 int intra_bcast_algo = -1;
 int inter_algo = 0;
 
@@ -75,7 +75,6 @@ static inline void init_comms(struct ompi_communicator_t* original_comm) {
         int resultlen;
         MPI_Get_processor_name(name, &resultlen);
 
-<<<<<<< HEAD
         ompi_comm_split(original_comm, hash(name, resultlen), key,
                         &intra_comm, false);
 
@@ -90,26 +89,6 @@ static inline void init_comms(struct ompi_communicator_t* original_comm) {
         if (0 == rank) {
           printf("inter_comm size = %d\n", ompi_comm_size(inter_comm));
         }
-
-        // Test
-=======
-        printf("Name %s -> %d\n", name, hash(name, resultlen));
-
-        ompi_comm_split(original_comm, hash(name, resultlen), key,
-                        &intra_comm, false);
-
-        // Get GPU group
-        int device;
-        cudaGetDevice(&device);
-        ompi_comm_split(original_comm, device, key,
-                        &gpu_group_comm, false);
-
-        // Test
-        printf("World Rank %d, GPU Rank %d, Intra Comm Rank %d\n",
-               original_comm->c_my_rank,
-               gpu_group_comm->c_my_rank,
-               intra_comm->c_my_rank);
-
 
         char *env = getenv("USE_HIERARCHICAL_ALLREDUCE");
         if (NULL != env) {
@@ -210,6 +189,8 @@ int bcast_switch(void *buff, int count,
 #define REDUCE_INTRA_BINOMIAL        2
 #define REDUCE_INTRA_IN_ORDER_BINARY 3
 #define REDUCE_INTRA_PIPELINE        4
+
+int debug_switch = 0;
 
 int reduce_switch(const void *sendbuf, void *recvbuf,
                   int count, struct ompi_datatype_t* datatype,
@@ -500,6 +481,7 @@ int ompi_coll_tuned_bcast_intra_dec_fixed(void *buff, int count,
     size_t message_size, dsize;
 
     communicator_size = ompi_comm_size(comm);
+    init_comms(comm);
 
     /* else we need data size for decision function */
     ompi_datatype_type_size(datatype, &dsize);
@@ -646,6 +628,8 @@ int ompi_coll_tuned_reduce_intra_dec_fixed( const void *sendbuf, void *recvbuf,
     const double b4 =  1.6761;
 
     const int max_requests = 0; /* no limit on # of outstanding requests */
+
+    init_comms(comm);
 
     communicator_size = ompi_comm_size(comm);
 
