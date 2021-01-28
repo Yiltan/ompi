@@ -166,13 +166,13 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
     if (NULL == inplacebuf_free) { ret = -1; line = __LINE__; goto error_hndl; }
     inplacebuf = inplacebuf_free - gap;
 
-    if (MPI_IN_PLACE == sbuf) {
-        ret = ompi_datatype_copy_content_same_ddt(dtype, count, inplacebuf, (char*)rbuf);
-        if (ret < 0) { line = __LINE__; goto error_hndl; }
-    } else {
-        ret = ompi_datatype_copy_content_same_ddt(dtype, count, inplacebuf, (char*)sbuf);
-        if (ret < 0) { line = __LINE__; goto error_hndl; }
-    }
+//    if (MPI_IN_PLACE == sbuf) {
+//        ret = ompi_datatype_copy_content_same_ddt(dtype, count, inplacebuf, (char*)rbuf);
+//        if (ret < 0) { line = __LINE__; goto error_hndl; }
+//    } else {
+//        ret = ompi_datatype_copy_content_same_ddt(dtype, count, inplacebuf, (char*)sbuf);
+//        if (ret < 0) { line = __LINE__; goto error_hndl; }
+//    }
 
     tmpsend = (char*) inplacebuf;
     tmprecv = (char*) rbuf;
@@ -215,6 +215,7 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
        result = value (op) result
     */
     for (distance = 0x1; distance < adjsize; distance <<=1) {
+
         if (newrank < 0) break;
         /* Determine remote node */
         newremote = newrank ^ distance;
@@ -222,24 +223,27 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
             (newremote * 2 + 1):(newremote + extra_ranks);
 
         /* Exchange the data */
-        ret = ompi_coll_base_sendrecv_actual(tmpsend, count, dtype, remote,
+        ret = ompi_coll_base_sendrecv_actual(rbuf, count, dtype, remote,
                                              MCA_COLL_BASE_TAG_ALLREDUCE,
-                                             tmprecv, count, dtype, remote,
+                                             inplacebuf, count, dtype, remote,
                                              MCA_COLL_BASE_TAG_ALLREDUCE,
                                              comm, MPI_STATUS_IGNORE);
+
         if (MPI_SUCCESS != ret) { line = __LINE__; goto error_hndl; }
 
         /* Apply operation */
-        if (rank < remote) {
-            /* tmprecv = tmpsend (op) tmprecv */
-            ompi_op_reduce(op, tmpsend, tmprecv, count, dtype);
-            tmpswap = tmprecv;
-            tmprecv = tmpsend;
-            tmpsend = tmpswap;
-        } else {
-            /* tmpsend = tmprecv (op) tmpsend */
-            ompi_op_reduce(op, tmprecv, tmpsend, count, dtype);
-        }
+        /* rbuf = inplacebuf (op) rbuf */
+        ompi_op_reduce(op, inplacebuf, rbuf, count, dtype);
+//        if (rank < remote) {
+//            /* tmprecv = tmpsend (op) tmprecv */
+//            ompi_op_reduce(op, tmpsend, tmprecv, count, dtype);
+//            tmpswap = tmprecv;
+//            tmprecv = tmpsend;
+//            tmpsend = tmpswap;
+//        } else {
+//            /* tmpsend = tmprecv (op) tmpsend */
+//            ompi_op_reduce(op, tmprecv, tmpsend, count, dtype);
+//        }
     }
 
     /* Handle non-power-of-two case:
@@ -263,10 +267,10 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
     }
 
     /* Ensure that the final result is in rbuf */
-    if (tmpsend != rbuf) {
-        ret = ompi_datatype_copy_content_same_ddt(dtype, count, (char*)rbuf, tmpsend);
-        if (ret < 0) { line = __LINE__; goto error_hndl; }
-    }
+//    if (tmpsend != rbuf) {
+//        ret = ompi_datatype_copy_content_same_ddt(dtype, count, (char*)rbuf, tmpsend);
+//        if (ret < 0) { line = __LINE__; goto error_hndl; }
+//    }
 
     if (NULL != inplacebuf_free && !isCudaBuffer) free(inplacebuf_free);
     return MPI_SUCCESS;
@@ -1268,6 +1272,227 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
         free(rcount);
     if (NULL != scount)
         free(scount);
+    return err;
+}
+
+/*
+ * ompi_coll_base_allreduce_intra_yht
+ *
+ * Function:  Allreduce using Rabenseifner's algorithm.
+ * Accepts:   Same arguments as MPI_Allreduce
+ * Returns:   MPI_SUCCESS or error code
+ *
+ * Description: an implementation of Rabenseifner's allreduce algorithm [1, 2].
+ *
+ * Step 1. If the number of processes is not a power of two, reduce it to
+ *
+ * Step 2. The remaining processes now perform a reduce-scatter by using
+ *
+ * Step 3. An allgather is performed by using recursive vector doubling and
+ *
+ * Limitations:
+ *   intra-communicators only
+ *
+ * Memory requirements (per process):
+ */
+
+static struct ompi_communicator_t *comm_cache;
+static struct ompi_communicator_t *intra_node_comm;
+static struct ompi_communicator_t *intra_socket_comm;
+static struct ompi_communicator_t *inter_socket_comm;
+
+// This is a hash function from: http://www.cse.yorku.ca/~oz/hash.html
+static inline int hash(char *input, int len) {
+    unsigned char *str = (unsigned char *) input;
+    unsigned long hash = 5381;
+    int c;
+
+    while (c = *str++) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+        len = len - 1;
+    }
+
+    return abs((int) hash);
+}
+
+void init_comm(struct ompi_communicator_t *original_comm) {
+    if (comm_cache != original_comm) {
+        comm_cache = original_comm;
+
+        int world_rank = ompi_comm_rank(original_comm);
+
+        // Get intra-node comm
+        char name[MPI_MAX_PROCESSOR_NAME];
+        int resultlen;
+        MPI_Get_processor_name(name, &resultlen);
+
+        ompi_comm_split(original_comm, hash(name, resultlen), world_rank,
+                        &intra_node_comm, false);
+
+        // Get intra-socket comm
+        // We assume that processes will be mapped as:
+        // [0,1] on CPU0 and [2,3] on CPU1 and GPU0 will be in rank 0.
+
+        int intra_node_rank = ompi_comm_rank(intra_node_comm);
+        int socket = intra_node_rank / 2; // handling assumption
+
+        ompi_comm_split(intra_node_comm, socket, intra_node_rank,
+                        &intra_socket_comm, false);
+
+        // Get inter-socket comm
+        // We assume that processes will be mapped as:
+        // [0,1] on CPU0 and [2,3] on CPU1 and GPU0 will be in rank 0.
+        // We try to get the groups [0,3] and [1,2]
+//        int color = (0 == intra_node_rank || 3 == intra_node_rank);
+//        ompi_comm_split(intra_node_comm, color, world_rank,
+//                        &inter_socket_comm, false);
+
+        int intra_socket_rank = ompi_comm_rank(intra_socket_comm);
+        ompi_comm_split(intra_node_comm, intra_socket_rank, world_rank,
+                        &inter_socket_comm, false);
+
+        printf("Rank=%d, Intra-Node=%d, Intra-Socket=%d, Inter-Socket=%d\n",
+               world_rank, intra_node_rank, intra_socket_rank,
+               ompi_comm_rank(inter_socket_comm));
+
+    }
+}
+
+int ompi_coll_base_allreduce_intra_yht(
+    const void *sbuf, void *rbuf, int count, struct ompi_datatype_t *dtype,
+    struct ompi_op_t *op, struct ompi_communicator_t *comm,
+    mca_coll_base_module_t *module)
+{
+    init_comm(comm);
+    // We are assuming sbuf == MPI_IN_PLACE
+
+    int comm_size = ompi_comm_size(comm);
+    int rank = ompi_comm_rank(comm);
+    int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
+
+    size_t dsize, gap = 0;
+    dsize = opal_datatype_span(&dtype->super, count, &gap);
+
+
+    char *tmp_send_buf = isCudaBuffer
+                       ? (char*) my_cudaMalloc(0)
+                       : (char*) malloc(dsize);
+
+    char *tmp_recv_buf = isCudaBuffer
+                       ? (char*) my_cudaMalloc(1)
+                       : (char*) malloc(dsize);
+
+
+    if (NULL == tmp_send_buf || NULL == tmp_recv_buf)
+      return OMPI_ERR_OUT_OF_RESOURCE;
+
+    /*
+     * Step 1. Intra Socket Reduce-scatter
+     */
+    int err = MPI_SUCCESS;
+
+    // Maybe create intra socket comms and just use ranks 0-1
+    int intra_socket_rank = ompi_comm_rank(intra_socket_comm);
+    int intra_socket_size = ompi_comm_size(intra_socket_comm);
+
+    int remote_rank = (intra_socket_rank + 1) % intra_socket_size;
+
+    int send_offset;
+    int recv_offset;
+    void *tmp_recv;
+    void *tmp_send;
+
+    if (0 == rank) {
+      send_offset = 0;
+      recv_offset = count / 2;
+    } else if (1 == rank) {
+      send_offset = count / 2;
+      recv_offset = 0;
+    } else if (2 == rank) {
+      send_offset = 0;
+      recv_offset = count / 2;
+    } else if (3 == rank) {
+      send_offset = count / 2;
+      recv_offset = 0;
+    }
+
+    tmp_recv = (void *) ((char *) tmp_send_buf + recv_offset);
+    tmp_send = (void *) ((char *) rbuf + send_offset);
+
+    //printf("%s\n", __func__);
+    err = ompi_coll_base_sendrecv_actual(tmp_recv,
+                                         count / 2, dtype, remote_rank,
+                                         MCA_COLL_BASE_TAG_ALLREDUCE,
+                                         tmp_send,
+                                         count / 2, dtype, remote_rank,
+                                         MCA_COLL_BASE_TAG_ALLREDUCE,
+                                         intra_socket_comm, MPI_STATUS_IGNORE);
+
+     /* tmp_send = tmprecv (op) tmp_send */
+     ompi_op_reduce(op, tmp_recv, tmp_send, count / 2, dtype);
+
+    /*
+     * Step 2. Inter Socket reduce
+     */
+
+    // Maybe create inter-socket comms and just use ranks 0-1
+    int tmp_offset;
+    tmp_offset = send_offset;
+    send_offset = recv_offset;
+    recv_offset = tmp_offset;
+
+    tmp_recv = (void *) ((char *) tmp_send + recv_offset);
+    tmp_send = (void *) ((char *) tmp_recv + send_offset);
+
+    int inter_socket_rank = ompi_comm_rank(inter_socket_comm);
+    int inter_socket_size = ompi_comm_size(inter_socket_comm);
+    remote_rank = (inter_socket_rank + 1) % inter_socket_size;
+
+    err = ompi_coll_base_sendrecv_actual(tmp_recv,
+                                         count / 2, dtype, remote_rank,
+                                         MCA_COLL_BASE_TAG_ALLREDUCE,
+                                         tmp_send,
+                                         count / 2, dtype, remote_rank,
+                                         MCA_COLL_BASE_TAG_ALLREDUCE,
+                                         inter_socket_comm, MPI_STATUS_IGNORE);
+
+    /* tmp_send = tmprecv (op) tmp_send */
+    ompi_op_reduce(op, tmp_recv, tmp_send, count/2, dtype);
+
+    /*
+     * Step 3. Intra Socket Gather
+     */
+
+    // Maybe create intra socket comms and just use ranks 0-1
+    remote_rank = (intra_socket_rank + 1) % intra_socket_size;
+    if (0 == rank) {
+      send_offset = 0;
+      recv_offset = count / 2;
+    } else if (1 == rank) {
+      send_offset = count / 2;
+      recv_offset = 0;
+    } else if (2 == rank) {
+      send_offset = 0;
+      recv_offset = count / 2;
+    } else if (3 == rank) {
+      send_offset = count / 2;
+      recv_offset = 0;
+    }
+
+    tmp_recv = (void *) ((char *) tmp_send_buf + recv_offset);
+    tmp_send = (void *) ((char *) rbuf + send_offset);
+
+    err = ompi_coll_base_sendrecv_actual(tmp_recv,
+                                         count / 2, dtype, remote_rank,
+                                         MCA_COLL_BASE_TAG_ALLREDUCE,
+                                         tmp_send,
+                                         count / 2, dtype, remote_rank,
+                                         MCA_COLL_BASE_TAG_ALLREDUCE,
+                                         intra_socket_comm, MPI_STATUS_IGNORE);
+
+  if (MPI_SUCCESS != err) { goto cleanup_and_return; }
+
+  cleanup_and_return:
     return err;
 }
 

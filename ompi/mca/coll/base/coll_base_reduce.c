@@ -98,8 +98,6 @@ int ompi_coll_base_reduce_generic( const void* sendbuf, void* recvbuf, int origi
 
   rank = ompi_comm_rank(comm);
 
-  printf("[%d] isCudaBuffer = %d\n", rank, isCudaBuffer);
-
   /* non-leaf nodes - wait for children to send me data & forward up
      (if needed) */
   if( tree->tree_nextsize > 0 ) {

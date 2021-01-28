@@ -123,6 +123,7 @@ static inline void init_comms(struct ompi_communicator_t* original_comm) {
 #define ALLREDUCE_INTRA_RING_SEGMENTED    3
 #define ALLREDUCE_INTRA_BASIC_LINEAR      4
 #define ALLREDUCE_INTRA_REDSCAT_ALLGATHER 5
+#define ALLREDUCE_INTRA_YHT               6
 
 int allreduce_switch(const void *sbuf, void *rbuf, int count,
                      struct ompi_datatype_t *dtype,
@@ -152,9 +153,12 @@ int allreduce_switch(const void *sbuf, void *rbuf, int count,
                                                          dtype, op, comm, module);
       break;
     case ALLREDUCE_INTRA_REDSCAT_ALLGATHER:
-    default:
       return ompi_coll_base_allreduce_intra_redscat_allgather(sbuf, rbuf, count,
                                                               dtype, op, comm, module);
+      break;
+    case ALLREDUCE_INTRA_YHT:
+    default:
+      return ompi_coll_base_allreduce_intra_yht(sbuf, rbuf, count, dtype, op, comm, module);
       break;
   }
 }
@@ -250,8 +254,7 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
     // then use original algo.
     // This can be optimized later for single node if needed.
     const size_t segment_size = 1 << 20; /* 1 MB */
-    if (comm_size == ompi_comm_size(intra_comm) &&
-        0 == use_hierarchical_allreduce) {
+    if (0 == use_hierarchical_allreduce) {
         if (block_dsize < intermediate_message) {
             return (ompi_coll_base_allreduce_intra_recursivedoubling(sbuf, rbuf,
                                                                      count, dtype,
@@ -310,6 +313,11 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
         ret_val &= (ompi_coll_tuned_bcast_intra_dec_fixed(rbuf, count, dtype, 0,
                                                           intra_comm, module));
         return ret_val;
+    } else if (3 == use_hierarchical_allreduce) {
+        // Flat algo
+        return (allreduce_switch(sbuf, rbuf, count, dtype, op,
+                                 comm, module, segment_size,
+                                 intra_allreduce_algo));
     } else {
         return -1;
     }
