@@ -1419,14 +1419,20 @@ int ompi_coll_base_allreduce_intra_yht(
     tmp_recv = (void *) ((char *) tmp_send_buf + recv_offset);
     tmp_send = (void *) ((char *) rbuf + send_offset);
 
-    //printf("%s\n", __func__);
-    err = ompi_coll_base_sendrecv_actual(tmp_recv,
-                                         count / 2, dtype, remote_rank,
-                                         MCA_COLL_BASE_TAG_ALLREDUCE,
-                                         tmp_send,
-                                         count / 2, dtype, remote_rank,
-                                         MCA_COLL_BASE_TAG_ALLREDUCE,
-                                         intra_socket_comm, MPI_STATUS_IGNORE);
+    int line = 0;
+    size_t rtypesize, stypesize;
+    ompi_request_t *req = MPI_REQUEST_NULL;
+    ompi_status_public_t rstatus;
+
+    err = MCA_PML_CALL(irecv(tmp_recv, count / 2, dtype, remote_rank,
+                             MCA_COLL_BASE_TAG_ALLREDUCE,
+                             intra_socket_comm, &req));
+
+    err = MCA_PML_CALL(send(tmp_send, count / 2, dtype, remote_rank,
+                            MCA_COLL_BASE_TAG_ALLREDUCE,
+                            MCA_PML_BASE_SEND_STANDARD, intra_socket_comm));
+
+    err = ompi_request_wait( &req, &rstatus);
 
      /* tmp_send = tmprecv (op) tmp_send */
      ompi_op_reduce(op, tmp_recv, tmp_send, count / 2, dtype);
@@ -1448,13 +1454,15 @@ int ompi_coll_base_allreduce_intra_yht(
     int inter_socket_size = ompi_comm_size(inter_socket_comm);
     remote_rank = (inter_socket_rank + 1) % inter_socket_size;
 
-    err = ompi_coll_base_sendrecv_actual(tmp_recv,
-                                         count / 2, dtype, remote_rank,
-                                         MCA_COLL_BASE_TAG_ALLREDUCE,
-                                         tmp_send,
-                                         count / 2, dtype, remote_rank,
-                                         MCA_COLL_BASE_TAG_ALLREDUCE,
-                                         inter_socket_comm, MPI_STATUS_IGNORE);
+    err = MCA_PML_CALL(irecv(tmp_recv, count / 2, dtype, remote_rank,
+                             MCA_COLL_BASE_TAG_ALLREDUCE,
+                             inter_socket_comm, &req));
+
+    err = MCA_PML_CALL(send(tmp_send, count / 2, dtype, remote_rank,
+                            MCA_COLL_BASE_TAG_ALLREDUCE,
+                            MCA_PML_BASE_SEND_STANDARD, inter_socket_comm));
+
+    err = ompi_request_wait(&req, &rstatus);
 
     /* tmp_send = tmprecv (op) tmp_send */
     ompi_op_reduce(op, tmp_recv, tmp_send, count/2, dtype);
@@ -1482,13 +1490,15 @@ int ompi_coll_base_allreduce_intra_yht(
     tmp_recv = (void *) ((char *) tmp_send_buf + recv_offset);
     tmp_send = (void *) ((char *) rbuf + send_offset);
 
-    err = ompi_coll_base_sendrecv_actual(tmp_recv,
-                                         count / 2, dtype, remote_rank,
-                                         MCA_COLL_BASE_TAG_ALLREDUCE,
-                                         tmp_send,
-                                         count / 2, dtype, remote_rank,
-                                         MCA_COLL_BASE_TAG_ALLREDUCE,
-                                         intra_socket_comm, MPI_STATUS_IGNORE);
+    err = MCA_PML_CALL(irecv(tmp_recv, count / 2, dtype, remote_rank,
+                             MCA_COLL_BASE_TAG_ALLREDUCE,
+                             intra_socket_comm, &req));
+
+    err = MCA_PML_CALL(send(tmp_send, count / 2, dtype, remote_rank,
+                            MCA_COLL_BASE_TAG_ALLREDUCE,
+                            MCA_PML_BASE_SEND_STANDARD, intra_socket_comm));
+
+    err = ompi_request_wait( &req, &rstatus);
 
   if (MPI_SUCCESS != err) { goto cleanup_and_return; }
 

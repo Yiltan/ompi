@@ -318,6 +318,11 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
         return (allreduce_switch(sbuf, rbuf, count, dtype, op,
                                  comm, module, segment_size,
                                  intra_allreduce_algo));
+    } else if (4 == use_hierarchical_allreduce) {
+        // Flat algo
+        return (allreduce_switch(sbuf, rbuf, count, dtype, op,
+                                 intra_comm, module, segment_size,
+                                 intra_allreduce_algo));
     } else {
         return -1;
     }

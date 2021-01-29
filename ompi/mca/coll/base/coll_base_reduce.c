@@ -560,7 +560,9 @@ int ompi_coll_base_reduce_intra_in_order_binary( const void *sendbuf, void *recv
       dsize = opal_datatype_span(&datatype->super, count, &gap);
 
       if ((root == rank) && (MPI_IN_PLACE == sendbuf)) {
-          tmpbuf_free = (char *) malloc(dsize);
+          tmpbuf_free = isCudaBuffer
+                        ? my_cudaMalloc(0)
+                        : (char*)malloc(dsize);
           if (NULL == tmpbuf_free) {
               return MPI_ERR_INTERN;
           }
@@ -570,7 +572,9 @@ int ompi_coll_base_reduce_intra_in_order_binary( const void *sendbuf, void *recv
                                               (char*)recvbuf);
           use_this_sendbuf = tmpbuf;
       } else if (io_root == rank) {
-          tmpbuf_free = (char *) malloc(dsize);
+          tmpbuf_free = isCudaBuffer
+                        ? my_cudaMalloc(0)
+                        : (char*)malloc(dsize);
           if (NULL == tmpbuf_free) {
               return MPI_ERR_INTERN;
           }
@@ -603,7 +607,7 @@ int ompi_coll_base_reduce_intra_in_order_binary( const void *sendbuf, void *recv
           if (MPI_SUCCESS != ret) { return ret; }
       }
   }
-  if (NULL != tmpbuf_free) {
+  if (NULL != tmpbuf_free && !isCudaBuffer) {
       free(tmpbuf_free);
   }
 
