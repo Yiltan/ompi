@@ -655,9 +655,9 @@ ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int 
     ompi_datatype_type_size(dtype, &dtype_size);
 
     // If message size is > 4MB, assuming floats
-    if (1024 * 1024 < count) {
-      segsize = (uint32_t) count * (uint32_t) ((int) dtype_size / 4);
-    }
+//    if (1024 * 1024 < count) {
+//      segsize = (uint32_t) count * (uint32_t) ((int) dtype_size / 4);
+//    }
 
     isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
@@ -1037,7 +1037,10 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
                       : (char*) malloc(dsize);
     if (NULL == tmp_buf_raw)
         return OMPI_ERR_OUT_OF_RESOURCE;
-    tmp_buf = tmp_buf_raw - gap;
+
+    tmp_buf = isCudaBuffer
+            ?  tmp_buf_raw
+            : tmp_buf_raw - gap;
 
     if (sbuf != MPI_IN_PLACE) {
         err = ompi_datatype_copy_content_same_ddt(dtype, count, (char *)rbuf,
@@ -1244,22 +1247,22 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
     /*
      * Step 4. Send total result to excluded odd ranks.
      */
-    if (rank < 2 * nprocs_rem) {
-        if (rank % 2 != 0) {
-            /* Odd process -- recv result from rank - 1 */
-            err = MCA_PML_CALL(recv(rbuf, count, dtype, rank - 1,
-                                    MCA_COLL_BASE_TAG_ALLREDUCE, comm,
-                                    MPI_STATUS_IGNORE));
-            if (OMPI_SUCCESS != err) { goto cleanup_and_return; }
-
-        } else {
-            /* Even process -- send result to rank + 1 */
-            err = MCA_PML_CALL(send(rbuf, count, dtype, rank + 1,
-                                    MCA_COLL_BASE_TAG_ALLREDUCE,
-                                    MCA_PML_BASE_SEND_STANDARD, comm));
-            if (MPI_SUCCESS != err) { goto cleanup_and_return; }
-        }
-    }
+//    if (rank < 2 * nprocs_rem) {
+//        if (rank % 2 != 0) {
+//            /* Odd process -- recv result from rank - 1 */
+//            err = MCA_PML_CALL(recv(rbuf, count, dtype, rank - 1,
+//                                    MCA_COLL_BASE_TAG_ALLREDUCE, comm,
+//                                    MPI_STATUS_IGNORE));
+//            if (OMPI_SUCCESS != err) { goto cleanup_and_return; }
+//
+//        } else {
+//            /* Even process -- send result to rank + 1 */
+//            err = MCA_PML_CALL(send(rbuf, count, dtype, rank + 1,
+//                                    MCA_COLL_BASE_TAG_ALLREDUCE,
+//                                    MCA_PML_BASE_SEND_STANDARD, comm));
+//            if (MPI_SUCCESS != err) { goto cleanup_and_return; }
+//        }
+//    }
 
   cleanup_and_return:
     if (NULL != tmp_buf_raw && !isCudaBuffer)
@@ -1296,66 +1299,14 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
  * Memory requirements (per process):
  */
 
-static struct ompi_communicator_t *comm_cache;
-static struct ompi_communicator_t *intra_node_comm;
-static struct ompi_communicator_t *intra_socket_comm;
-static struct ompi_communicator_t *inter_socket_comm;
+int initialized = 0;
+int use_pap_kernel = 0;
 
-// This is a hash function from: http://www.cse.yorku.ca/~oz/hash.html
-static inline int hash(char *input, int len) {
-    unsigned char *str = (unsigned char *) input;
-    unsigned long hash = 5381;
-    int c;
-
-    while (c = *str++) {
-        hash = ((hash << 5) + hash) + c; // hash * 33 + c
-        len = len - 1;
-    }
-
-    return abs((int) hash);
-}
-
-void init_comm(struct ompi_communicator_t *original_comm) {
-    if (comm_cache != original_comm) {
-        comm_cache = original_comm;
-
-        int world_rank = ompi_comm_rank(original_comm);
-
-        // Get intra-node comm
-        char name[MPI_MAX_PROCESSOR_NAME];
-        int resultlen;
-        MPI_Get_processor_name(name, &resultlen);
-
-        ompi_comm_split(original_comm, hash(name, resultlen), world_rank,
-                        &intra_node_comm, false);
-
-        // Get intra-socket comm
-        // We assume that processes will be mapped as:
-        // [0,1] on CPU0 and [2,3] on CPU1 and GPU0 will be in rank 0.
-
-        int intra_node_rank = ompi_comm_rank(intra_node_comm);
-        int socket = intra_node_rank / 2; // handling assumption
-
-        ompi_comm_split(intra_node_comm, socket, intra_node_rank,
-                        &intra_socket_comm, false);
-
-        // Get inter-socket comm
-        // We assume that processes will be mapped as:
-        // [0,1] on CPU0 and [2,3] on CPU1 and GPU0 will be in rank 0.
-        // We try to get the groups [0,3] and [1,2]
-//        int color = (0 == intra_node_rank || 3 == intra_node_rank);
-//        ompi_comm_split(intra_node_comm, color, world_rank,
-//                        &inter_socket_comm, false);
-
-        int intra_socket_rank = ompi_comm_rank(intra_socket_comm);
-        ompi_comm_split(intra_node_comm, intra_socket_rank, world_rank,
-                        &inter_socket_comm, false);
-
-        printf("Rank=%d, Intra-Node=%d, Intra-Socket=%d, Inter-Socket=%d\n",
-               world_rank, intra_node_rank, intra_socket_rank,
-               ompi_comm_rank(inter_socket_comm));
-
-    }
+void init() {
+   char *env = getenv("PAP_KERNEL");
+   if (NULL != env) {
+       use_pap_kernel = atoi(env);
+   }
 }
 
 int ompi_coll_base_allreduce_intra_yht(
@@ -1363,147 +1314,175 @@ int ompi_coll_base_allreduce_intra_yht(
     struct ompi_op_t *op, struct ompi_communicator_t *comm,
     mca_coll_base_module_t *module)
 {
-    init_comm(comm);
-    // We are assuming sbuf == MPI_IN_PLACE
+  if (MPI_IN_PLACE != sbuf) {
+      return -1; // MPI_ERROR?
+  }
 
-    int comm_size = ompi_comm_size(comm);
-    int rank = ompi_comm_rank(comm);
-    int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
+  if (!initialized) {
+      init();
+  }
 
-    size_t dsize, gap = 0;
-    dsize = opal_datatype_span(&dtype->super, count, &gap);
+  int comm_size = ompi_comm_size(comm);
+  int rank = ompi_comm_rank(comm);
+  int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
+  ptrdiff_t lb, extent, dsize, gap = 0;
+  ompi_datatype_get_extent(dtype, &lb, &extent);
+  dsize = opal_datatype_span(&dtype->super, count, &gap);
 
-    char *tmp_send_buf = isCudaBuffer
-                       ? (char*) my_cudaMalloc(0)
-                       : (char*) malloc(dsize);
+  int chunk_count = count / 4;
+  ptrdiff_t chunk_size = (count / 4) * extent;
 
-    char *tmp_recv_buf = isCudaBuffer
-                       ? (char*) my_cudaMalloc(1)
-                       : (char*) malloc(dsize);
+  char *tmp_buf = isCudaBuffer
+    ? (char*) my_cudaMalloc(0)
+    : (char*) malloc(dsize);
 
+  if (NULL == tmp_buf)
+    return OMPI_ERR_OUT_OF_RESOURCE;
 
-    if (NULL == tmp_send_buf || NULL == tmp_recv_buf)
-      return OMPI_ERR_OUT_OF_RESOURCE;
+#define NUM_GPUS 4
 
-    /*
-     * Step 1. Intra Socket Reduce-scatter
-     */
-    int err = MPI_SUCCESS;
+  ompi_request_t *recv_reqs[3] = {NULL, NULL, NULL};
+  ompi_request_t *send_reqs[3] = {NULL, NULL, NULL};
 
-    // Maybe create intra socket comms and just use ranks 0-1
-    int intra_socket_rank = ompi_comm_rank(intra_socket_comm);
-    int intra_socket_size = ompi_comm_size(intra_socket_comm);
+  int err = MPI_SUCCESS;
+  int idx_to_rank[3];
+  int req_idx = 0;
 
-    int remote_rank = (intra_socket_rank + 1) % intra_socket_size;
+  // Reduce Scatter
+  // Post Recvs as this required for UCX to exchange the IPC handle
+  req_idx = 0;
+  for (int i=0; i<NUM_GPUS; i++) {
+      if (rank != i) {
+          err = MCA_PML_CALL(irecv(tmp_buf + (i * chunk_size),
+                                   chunk_count, dtype, i,
+                                   MCA_COLL_BASE_TAG_ALLREDUCE, comm,
+                                   &recv_reqs[req_idx]));
+          idx_to_rank[req_idx] = i;
+          req_idx++;
+      }
+  }
 
-    int send_offset;
-    int recv_offset;
-    void *tmp_recv;
-    void *tmp_send;
+  // Now send the chunks
+  req_idx = 0;
+  for (int i=0; i<NUM_GPUS; i++) {
+      if (rank != i) {
+          err = MCA_PML_CALL(isend(((char*) rbuf + (rank * chunk_size)),
+                                   chunk_count, dtype, i,
+                                   MCA_COLL_BASE_TAG_ALLREDUCE,
+                                   MCA_PML_BASE_SEND_STANDARD, comm,
+                                   &send_reqs[req_idx]));
+          req_idx++;
+      }
+  }
 
-    if (0 == rank) {
-      send_offset = 0;
-      recv_offset = count / 2;
-    } else if (1 == rank) {
-      send_offset = count / 2;
-      recv_offset = 0;
-    } else if (2 == rank) {
-      send_offset = 0;
-      recv_offset = count / 2;
-    } else if (3 == rank) {
-      send_offset = count / 2;
-      recv_offset = 0;
-    }
+  int outcount;
+  int indices[3] = {-1, -1, -1};
+  int flag_send = 0;
 
-    tmp_recv = (void *) ((char *) tmp_send_buf + recv_offset);
-    tmp_send = (void *) ((char *) rbuf + send_offset);
+  int received[3] = {0, 0, 0};
 
-    int line = 0;
-    size_t rtypesize, stypesize;
-    ompi_request_t *req = MPI_REQUEST_NULL;
-    ompi_status_public_t rstatus;
+  int loop_again = 1;
 
-    err = MCA_PML_CALL(irecv(tmp_recv, count / 2, dtype, remote_rank,
-                             MCA_COLL_BASE_TAG_ALLREDUCE,
-                             intra_socket_comm, &req));
+  void *reduce_bufs[3] = {NULL, NULL, NULL};
+  int reduce_buf_count = 0;
+  void *buf_1 = NULL, *buf_2 = NULL;
 
-    err = MCA_PML_CALL(send(tmp_send, count / 2, dtype, remote_rank,
-                            MCA_COLL_BASE_TAG_ALLREDUCE,
-                            MCA_PML_BASE_SEND_STANDARD, intra_socket_comm));
+  do {
+      err = ompi_request_test_some(3, recv_reqs, &outcount, indices,
+                                   MPI_STATUSES_IGNORE);
 
-    err = ompi_request_wait( &req, &rstatus);
+      if (outcount != 0) {
+          for (int i=0; i<3; i++) {
+              int idx = indices[i];
+              if (-1 != idx) {
+                  received[idx] = 1;
 
-     /* tmp_send = tmprecv (op) tmp_send */
-     ompi_op_reduce(op, tmp_recv, tmp_send, count / 2, dtype);
+                  int src_rank = idx_to_rank[idx];
 
-    /*
-     * Step 2. Inter Socket reduce
-     */
+                  reduce_bufs[idx] = ((char*) tmp_buf + (src_rank * chunk_size));
+                  reduce_buf_count++;
 
-    // Maybe create inter-socket comms and just use ranks 0-1
-    int tmp_offset;
-    tmp_offset = send_offset;
-    send_offset = recv_offset;
-    recv_offset = tmp_offset;
+                  indices[i] = -1;;
+              }
+          }
+      }
 
-    tmp_recv = (void *) ((char *) tmp_send + recv_offset);
-    tmp_send = (void *) ((char *) tmp_recv + send_offset);
+      err = ompi_request_test_all(3, send_reqs, &flag_send, MPI_STATUSES_IGNORE);
 
-    int inter_socket_rank = ompi_comm_rank(inter_socket_comm);
-    int inter_socket_size = ompi_comm_size(inter_socket_comm);
-    remote_rank = (inter_socket_rank + 1) % inter_socket_size;
+      if (use_pap_kernel) {
+          if (reduce_buf_count >= 2) {
+              buf_1 = NULL, buf_2 = NULL;
+              for (int i=0; i<3; i++) {
+                  if (NULL != reduce_bufs[i]) {
+                      if (NULL == buf_1) {
+                          buf_1 = reduce_bufs[i];
+                          //reduce_buf[i] = NULL;
+                      } else {
+                          buf_2 = reduce_bufs[i];
+                          reduce_bufs[i] = NULL;
+                          reduce_buf_count--;
+                      }
+                  }
 
-    err = MCA_PML_CALL(irecv(tmp_recv, count / 2, dtype, remote_rank,
-                             MCA_COLL_BASE_TAG_ALLREDUCE,
-                             inter_socket_comm, &req));
+                  if ((NULL != buf_1) && (NULL != buf_2)) {
+                      ompi_op_reduce(op, buf_2, buf_1, chunk_count, dtype);
+                      break;
+                  }
+              }
+          }
+      }
 
-    err = MCA_PML_CALL(send(tmp_send, count / 2, dtype, remote_rank,
-                            MCA_COLL_BASE_TAG_ALLREDUCE,
-                            MCA_PML_BASE_SEND_STANDARD, inter_socket_comm));
+      loop_again = !flag_send;
+      for (int i=0; i<3; i++) {
+          loop_again = loop_again || !received[i];
+      }
+  } while (loop_again);
 
-    err = ompi_request_wait(&req, &rstatus);
+  if (use_pap_kernel) {
+      ompi_op_reduce(op, buf_1,
+                     ((char*)rbuf + (rank * chunk_size)),
+                     chunk_count, dtype);
+  } else {
+      for (int i=0; i<3; i++) {
+          ompi_op_reduce(op, reduce_bufs[i],
+                         ((char*)rbuf + (rank * chunk_size)),
+                         chunk_count, dtype);
+      }
+  }
 
-    /* tmp_send = tmprecv (op) tmp_send */
-    ompi_op_reduce(op, tmp_recv, tmp_send, count/2, dtype);
+  // Post Recvs as this required for UCX to exchange the IPC handle
+  req_idx = 0;
+  for (int i=0; i<NUM_GPUS; i++) {
+      if (rank != i) {
+          err = MCA_PML_CALL(irecv(((char*) rbuf + (i * chunk_size)),
+                                   chunk_count, dtype, i,
+                                   MCA_COLL_BASE_TAG_ALLREDUCE, comm,
+                                   &recv_reqs[req_idx]));
+          req_idx++;
+      }
+  }
 
-    /*
-     * Step 3. Intra Socket Gather
-     */
+  // Now send the chunks
+  req_idx = 0;
+  for (int i=0; i<NUM_GPUS; i++) {
+      if (rank != i) {
+          err = MCA_PML_CALL(isend(((char *) rbuf + (rank * chunk_size)),
+                                   chunk_count, dtype, i,
+                                   MCA_COLL_BASE_TAG_ALLREDUCE,
+                                   MCA_PML_BASE_SEND_STANDARD, comm,
+                                   &send_reqs[req_idx]));
+          req_idx++;
+      }
+  }
 
-    // Maybe create intra socket comms and just use ranks 0-1
-    remote_rank = (intra_socket_rank + 1) % intra_socket_size;
-    if (0 == rank) {
-      send_offset = 0;
-      recv_offset = count / 2;
-    } else if (1 == rank) {
-      send_offset = count / 2;
-      recv_offset = 0;
-    } else if (2 == rank) {
-      send_offset = 0;
-      recv_offset = count / 2;
-    } else if (3 == rank) {
-      send_offset = count / 2;
-      recv_offset = 0;
-    }
-
-    tmp_recv = (void *) ((char *) tmp_send_buf + recv_offset);
-    tmp_send = (void *) ((char *) rbuf + send_offset);
-
-    err = MCA_PML_CALL(irecv(tmp_recv, count / 2, dtype, remote_rank,
-                             MCA_COLL_BASE_TAG_ALLREDUCE,
-                             intra_socket_comm, &req));
-
-    err = MCA_PML_CALL(send(tmp_send, count / 2, dtype, remote_rank,
-                            MCA_COLL_BASE_TAG_ALLREDUCE,
-                            MCA_PML_BASE_SEND_STANDARD, intra_socket_comm));
-
-    err = ompi_request_wait( &req, &rstatus);
+  ompi_request_wait_all(3, recv_reqs, MPI_STATUSES_IGNORE);
+  ompi_request_wait_all(3, send_reqs, MPI_STATUSES_IGNORE);
 
   if (MPI_SUCCESS != err) { goto cleanup_and_return; }
 
-  cleanup_and_return:
-    return err;
+cleanup_and_return:
+  return err;
 }
 
 /* copied function (with appropriate renaming) ends here */

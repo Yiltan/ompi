@@ -58,6 +58,8 @@ int ompi_coll_base_reduce_scatter_intra_nonoverlapping(const void *sbuf, void *r
     rank = ompi_comm_rank(comm);
     size = ompi_comm_size(comm);
 
+    int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
+
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output,"coll:base:reduce_scatter_intra_nonoverlapping, rank %d", rank));
 
     for (i = 0, total_count = 0; i < size; i++) { total_count += rcounts[i]; }
@@ -147,6 +149,8 @@ ompi_coll_base_reduce_scatter_intra_basic_recursivehalving( const void *sbuf,
     rank = ompi_comm_rank(comm);
     size = ompi_comm_size(comm);
 
+    int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
+
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output,"coll:base:reduce_scatter_intra_basic_recursivehalving, rank %d", rank));
 
     /* Find displacements and the like */
@@ -175,7 +179,9 @@ ompi_coll_base_reduce_scatter_intra_basic_recursivehalving( const void *sbuf,
     }
 
     /* Allocate temporary receive buffer. */
-    recv_buf_free = (char*) malloc(buf_size);
+    recv_buf_free = isCudaBuffer
+                  ? my_cudaMalloc(0)
+                  : (char*) malloc(buf_size);
     recv_buf = recv_buf_free - gap;
     if (NULL == recv_buf_free) {
         err = OMPI_ERR_OUT_OF_RESOURCE;
@@ -183,7 +189,9 @@ ompi_coll_base_reduce_scatter_intra_basic_recursivehalving( const void *sbuf,
     }
 
     /* allocate temporary buffer for results */
-    result_buf_free = (char*) malloc(buf_size);
+    result_buf_free = isCudaBuffer
+                    ? my_cudaMalloc(0)
+                    : (char*) malloc(buf_size);
     result_buf = result_buf_free - gap;
 
     /* copy local buffer into the temporary results */
@@ -384,8 +392,8 @@ ompi_coll_base_reduce_scatter_intra_basic_recursivehalving( const void *sbuf,
 
  cleanup:
     if (NULL != disps) free(disps);
-    if (NULL != recv_buf_free) free(recv_buf_free);
-    if (NULL != result_buf_free) free(result_buf_free);
+    if (NULL != recv_buf_free && !isCudaBuffer) free(recv_buf_free);
+    if (NULL != result_buf_free && !isCudaBuffer) free(result_buf_free);
 
     return err;
 }
@@ -466,6 +474,8 @@ ompi_coll_base_reduce_scatter_intra_ring( const void *sbuf, void *rbuf, const in
     ptrdiff_t extent, max_real_segsize, dsize, gap = 0;
     ompi_request_t *reqs[2] = {NULL, NULL};
 
+    int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
+
     size = ompi_comm_size(comm);
     rank = ompi_comm_rank(comm);
 
@@ -509,15 +519,21 @@ ompi_coll_base_reduce_scatter_intra_ring( const void *sbuf, void *rbuf, const in
     max_real_segsize = opal_datatype_span(&dtype->super, max_block_count, &gap);
     dsize = opal_datatype_span(&dtype->super, total_count, &gap);
 
-    accumbuf_free = (char*)malloc(dsize);
+    accumbuf_free = isCudaBuffer
+                  ? my_cudaMalloc(0)
+                  : (char*) malloc(dsize);
     if (NULL == accumbuf_free) { ret = -1; line = __LINE__; goto error_hndl; }
     accumbuf = accumbuf_free - gap;
 
-    inbuf_free[0] = (char*)malloc(max_real_segsize);
+    inbuf_free[0] = isCudaBuffer
+                  ? my_cudaMalloc(0)
+                  : (char*) malloc(max_real_segsize);
     if (NULL == inbuf_free[0]) { ret = -1; line = __LINE__; goto error_hndl; }
     inbuf[0] = inbuf_free[0] - gap;
     if (size > 2) {
-        inbuf_free[1] = (char*)malloc(max_real_segsize);
+        inbuf_free[1] = isCudaBuffer
+                      ? my_cudaMalloc(1)
+                      : (char*) malloc(max_real_segsize);
         if (NULL == inbuf_free[1]) { ret = -1; line = __LINE__; goto error_hndl; }
         inbuf[1] = inbuf_free[1] - gap;
     }
@@ -605,9 +621,9 @@ ompi_coll_base_reduce_scatter_intra_ring( const void *sbuf, void *rbuf, const in
     if (ret < 0) { line = __LINE__; goto error_hndl; }
 
     if (NULL != displs) free(displs);
-    if (NULL != accumbuf_free) free(accumbuf_free);
-    if (NULL != inbuf_free[0]) free(inbuf_free[0]);
-    if (NULL != inbuf_free[1]) free(inbuf_free[1]);
+    if (NULL != accumbuf_free && !isCudaBuffer) free(accumbuf_free);
+    if (NULL != inbuf_free[0] && !isCudaBuffer) free(inbuf_free[0]);
+    if (NULL != inbuf_free[1] && !isCudaBuffer) free(inbuf_free[1]);
 
     return MPI_SUCCESS;
 
@@ -616,9 +632,9 @@ ompi_coll_base_reduce_scatter_intra_ring( const void *sbuf, void *rbuf, const in
                  __FILE__, line, rank, ret));
     (void)line;  // silence compiler warning
     if (NULL != displs) free(displs);
-    if (NULL != accumbuf_free) free(accumbuf_free);
-    if (NULL != inbuf_free[0]) free(inbuf_free[0]);
-    if (NULL != inbuf_free[1]) free(inbuf_free[1]);
+    if (NULL != accumbuf_free && !isCudaBuffer) free(accumbuf_free);
+    if (NULL != inbuf_free[0] && !isCudaBuffer) free(inbuf_free[0]);
+    if (NULL != inbuf_free[1] && !isCudaBuffer) free(inbuf_free[1]);
     return ret;
 }
 
@@ -699,6 +715,7 @@ ompi_coll_base_reduce_scatter_intra_butterfly(
     int err = MPI_SUCCESS;
     int comm_size = ompi_comm_size(comm);
     int rank = ompi_comm_rank(comm);
+    int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
 
     OPAL_OUTPUT((ompi_coll_base_framework.framework_output,
                  "coll:base:reduce_scatter_intra_butterfly: rank %d/%d",
@@ -719,8 +736,13 @@ ompi_coll_base_reduce_scatter_intra_butterfly(
 
     ompi_datatype_type_extent(dtype, &extent);
     span = opal_datatype_span(&dtype->super, totalcount, &gap);
-    tmpbuf[0] = malloc(span);
-    tmpbuf[1] = malloc(span);
+    tmpbuf[0] = isCudaBuffer
+              ? my_cudaMalloc(0)
+              : (char*) malloc(span);
+    tmpbuf[1] = isCudaBuffer
+              ? my_cudaMalloc(1)
+              : (char*) malloc(span);
+
     if (NULL == tmpbuf[0] || NULL == tmpbuf[1]) {
         err = OMPI_ERR_OUT_OF_RESOURCE;
         goto cleanup_and_return;
@@ -889,9 +911,7 @@ ompi_coll_base_reduce_scatter_intra_butterfly(
 cleanup_and_return:
     if (displs)
         free(displs);
-    if (tmpbuf[0])
-        free(tmpbuf[0]);
-    if (tmpbuf[1])
-        free(tmpbuf[1]);
+    if (tmpbuf[0] && !isCudaBuffer) free(tmpbuf[0]);
+    if (tmpbuf[1] && !isCudaBuffer) free(tmpbuf[1]);
     return err;
 }

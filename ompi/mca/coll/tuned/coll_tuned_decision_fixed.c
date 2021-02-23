@@ -41,6 +41,7 @@ int use_hierarchical_allreduce = 0;
 int intra_allreduce_algo = 0;
 int intra_reduce_algo = -1;
 int intra_bcast_algo = -1;
+int intra_reduce_scatter_algo = -1;
 int inter_algo = 0;
 
 struct ompi_communicator_t* intra_comm;
@@ -113,6 +114,11 @@ static inline void init_comms(struct ompi_communicator_t* original_comm) {
         env = getenv("REDUCE_INTRA_ALGO");
         if (NULL != env) {
           intra_reduce_algo = atoi(env);
+        }
+
+        env = getenv("REDUCE_SCATTER_INTRA_ALGO");
+        if (NULL != env) {
+          intra_reduce_scatter_algo = atoi(env);
         }
     }
 }
@@ -758,12 +764,15 @@ int ompi_coll_tuned_reduce_scatter_intra_dec_fixed( const void *sbuf, void *rbuf
                                                     struct ompi_communicator_t *comm,
                                                     mca_coll_base_module_t *module)
 {
+
     int comm_size, i, pow2;
     size_t total_message_size, dsize;
     const double a = 0.0012;
     const double b = 8.0;
     const size_t small_message_size = 12 * 1024;
     const size_t large_message_size = 256 * 1024;
+
+    init_comms(comm);
 
     OPAL_OUTPUT((ompi_coll_tuned_stream, "ompi_coll_tuned_reduce_scatter_intra_dec_fixed"));
 
@@ -785,15 +794,15 @@ int ompi_coll_tuned_reduce_scatter_intra_dec_fixed( const void *sbuf, void *rbuf
 
     /* compute the nearest power of 2 */
     pow2 = opal_next_poweroftwo_inclusive (comm_size);
-
-    if ((total_message_size <= small_message_size) ||
-        ((total_message_size <= large_message_size) && (pow2 == comm_size)) ||
-        (comm_size >= a * total_message_size + b)) {
-        return
-            ompi_coll_base_reduce_scatter_intra_basic_recursivehalving(sbuf, rbuf, rcounts,
-                                                                       dtype, op,
-                                                                       comm, module);
-    }
+//
+//    if ((total_message_size <= small_message_size) ||
+//        ((total_message_size <= large_message_size) && (pow2 == comm_size)) ||
+//        (comm_size >= a * total_message_size + b)) {
+//        return
+//            ompi_coll_base_reduce_scatter_intra_basic_recursivehalving(sbuf, rbuf, rcounts,
+//                                                                       dtype, op,
+//                                                                       comm, module);
+//    }
     return ompi_coll_base_reduce_scatter_intra_ring(sbuf, rbuf, rcounts,
                                                      dtype, op,
                                                      comm, module);

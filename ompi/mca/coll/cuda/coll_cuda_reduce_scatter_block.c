@@ -18,6 +18,26 @@
 #include "ompi/op/op.h"
 #include "opal/datatype/opal_convertor.h"
 #include "opal/datatype/opal_datatype_cuda.h"
+//int ucx_aware_status = -1;
+//static inline int is_ucx_aware() {
+//  if (ucx_aware_status == -1) {
+//    char* env = getenv("IS_UCX_AWARE");
+//
+//    if (NULL == env) {
+//      *env = '0';
+//    }
+//
+//    ucx_aware_status = atoi(env);
+//  }
+//  return ucx_aware_status;
+//}
+//
+//
+//  if (is_ucx_aware() && OMPI_OP_SUM == op->op_type) {
+//      return s->c_coll.coll_allreduce(sbuf, rbuf, count,
+//                                      dtype, op, comm,
+//                                      s->c_coll.coll_allreduce_module);
+//  }
 
 /*
  *	reduce_scatter_block
@@ -37,6 +57,7 @@ mca_coll_cuda_reduce_scatter_block(const void *sbuf, void *rbuf, int rcount,
                                    struct ompi_communicator_t *comm,
                                    mca_coll_base_module_t *module)
 {
+  printf("%s\n", __func__);
     mca_coll_cuda_module_t *s = (mca_coll_cuda_module_t*) module;
     ptrdiff_t gap;
     char *rbuf1 = NULL, *sbuf1 = NULL, *rbuf2 = NULL;
