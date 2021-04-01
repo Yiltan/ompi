@@ -1485,6 +1485,14 @@ cleanup_and_return:
   return err;
 }
 
+#define INTRA 420
+#define INTER 69
+
+// NUM_CHUNKS >= 4 for this to work
+#define NUM_CHUNKS 4
+#define PTR_OFFSET(PTR, IDX, CHUNK_SIZE) \
+                  ((void*) ((char*) PTR + (IDX * CHUNK_SIZE)))
+
 /* copied function (with appropriate renaming) ends here */
 int ompi_coll_base_allreduce_intra_yht2(
     const void *sbuf, void *rbuf, int count, struct ompi_datatype_t *dtype,
@@ -1507,410 +1515,77 @@ int ompi_coll_base_allreduce_intra_yht2(
   ompi_datatype_get_extent(dtype, &lb, &extent);
   dsize = opal_datatype_span(&dtype->super, count, &gap);
 
-  ompi_request_t *send_intra_reqs[4] = {NULL, NULL, NULL, NULL};
-  ompi_request_t *recv_intra_reqs[4] = {NULL, NULL, NULL, NULL};
+  ompi_request_t *send_intra_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
+  ompi_request_t *recv_intra_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
+  ompi_request_t *send_inter_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
+  ompi_request_t *recv_inter_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
 
-  ompi_request_t *send_inter_reqs[4] = {NULL, NULL, NULL, NULL};
-  ompi_request_t *recv_inter_reqs[4] = {NULL, NULL, NULL, NULL};
+  int chunk_count = count / NUM_CHUNKS;
+  ptrdiff_t chunk_size = (count / NUM_CHUNKS) * extent;
 
-  int chunk_count = count / 4;
-  ptrdiff_t chunk_size = (count / 4) * extent;
+  char *tmp_buf[2];
 
-  char *tmp_buf = isCudaBuffer
-    ? (char*) my_cudaMalloc(0, rbuf)
-    : (char*) malloc(dsize);
+  tmp_buf[0] = isCudaBuffer
+             ? (char*) my_cudaMalloc(0, rbuf)
+             : (char*) malloc(dsize);
+  tmp_buf[1] = isCudaBuffer
+             ? (char*) my_cudaMalloc(1, rbuf)
+             : (char*) malloc(dsize);
 
-  if (NULL == tmp_buf)
+  if (NULL == tmp_buf[0] || NULL == tmp_buf[1])
     return OMPI_ERR_OUT_OF_RESOURCE;
 
   int err = MPI_SUCCESS;
 
-#define INTRA 420
-#define INTER 69
-
-  // Step 1 intra-socket reduce
+  // Step 1
+  int remote;
+  int chunk_idx;
   if (0 == rank || 3 == rank) {
-      // intra send
-      int remote = 0 == rank ? 1 : 2;
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[0]));
-  } else { // (1 == rank || 2 == rank)
-      // intra recv
-      int remote = 1 == rank ? 0 : 3;
-      err = MCA_PML_CALL(irecv(tmp_buf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA, comm,
-                               &recv_intra_reqs[0]));
+      //sending chunks
+      remote = 0 == rank ? 1 : 2;
+      chunk_idx = 0;
+      err = MCA_PML_CALL(send(PTR_OFFSET(rbuf, chunk_idx, chunk_size),
+                              chunk_count, dtype, remote,
+                              MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                              MCA_PML_BASE_SEND_STANDARD, comm));
   }
 
-  // Step 2
-  if (0 == rank) {
-      // intra send
-      int remote = 1;
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[1]));
+  if (1 == rank || 2 == rank) {
+      remote = 1 == rank ? 0 : 3;
+      chunk_idx = 0;
 
-      err = ompi_request_wait(&send_intra_reqs[0], MPI_STATUS_IGNORE);
-  } else if (3 == rank) {
-      // intra send
-      int remote = 2;
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[1]));
-      err = ompi_request_wait(&send_intra_reqs[0], MPI_STATUS_IGNORE);
-  } else if (1 == rank) {
-      int remote = 0;
-      err = MCA_PML_CALL(irecv(tmp_buf + chunk_size, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA, comm,
-                               &recv_intra_reqs[1]));
+      err = MCA_PML_CALL(recv(PTR_OFFSET(tmp_buf[0], chunk_idx, chunk_size),
+                              chunk_count, dtype, remote,
+                              MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                              comm, MPI_STATUS_IGNORE));
 
-      remote = 2;
-      err = MCA_PML_CALL(irecv(tmp_buf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[0]));
-
-      err = ompi_request_wait(&recv_intra_reqs[0], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[0]));
-
-  } else { // 2 == rank
-      int remote = 3;
-      err = MCA_PML_CALL(irecv(tmp_buf + chunk_size, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA, comm,
-                               &recv_intra_reqs[1]));
-      remote = 1;
-      err = MCA_PML_CALL(irecv(tmp_buf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[0]));
-
-      err = ompi_request_wait(&recv_intra_reqs[0], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[0]));
-
+      /* rbuf = tmp_buf[0] (op) rbuf */
+      ompi_op_reduce(op,
+                     PTR_OFFSET(tmp_buf[0], chunk_idx, chunk_size),
+                     PTR_OFFSET(rbuf, chunk_idx, chunk_size),
+                     count, dtype);
   }
 
-  // Step 3
-  // Reduce B and A
-  if (0 == rank) {
-      int remote = 1;
-      //recv A from 1
-      err = MCA_PML_CALL(irecv(tmp_buf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[0]));
-      //send C to 1
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[2]));
-      err = ompi_request_wait(&send_intra_reqs[1], MPI_STATUS_IGNORE);
-  } else if (3 == rank) {
-      int remote = 2;
-      //recv A from 2
-      err = MCA_PML_CALL(irecv(tmp_buf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[0]));
-      //send C to 2
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[2]));
-      err = ompi_request_wait(&send_intra_reqs[1], MPI_STATUS_IGNORE);
-  } else if (1 == rank) {
-      int remote = 0;
-      //recv C from 0
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[2]));
+//      // Recive inter socket
+//      remote = 1 == rank ? 2 : 1;
+//      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
+//                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
+//                               comm, &recv_inter_reqs[i]));
+//
+//      remote = 1 == rank ? 2 : 1;
+//      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
+//                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
+//                               MCA_PML_BASE_SEND_STANDARD, comm,
+//                               &send_inter_reqs[i]));
+//
+//
+//  for (int i=0; i<4; i++) {
+//      if (1 == rank || 2 == rank) {
+//          err = ompi_request_wait(&send_inter_reqs[i], MPI_STATUS_IGNORE);
+//          err = ompi_request_wait(&recv_inter_reqs[i], MPI_STATUS_IGNORE);
+//      }
+//  }
 
-      //recv B from 2
-      remote = 2;
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[1]));
-
-      err = ompi_request_wait(&recv_intra_reqs[1], MPI_STATUS_IGNORE);
-
-      //reduce then send B to 2
-      remote = 2;
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[1]));
-
-      err = ompi_request_wait(&recv_inter_reqs[0], MPI_STATUS_IGNORE);
-      //reduce then send A to 0
-      remote = 0;
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[0]));
-
-      err = ompi_request_wait(&send_inter_reqs[0], MPI_STATUS_IGNORE);
-  } else { // 2 == rank
-      int remote = 3;
-      //recv C from 3
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[2]));
-
-      remote = 1;
-      //recv B from 1
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[1]));
-
-      err = ompi_request_wait(&recv_intra_reqs[1], MPI_STATUS_IGNORE);
-
-      //reduce then send B to 1
-      remote = 1;
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[1]));
-      err = ompi_request_wait(&recv_inter_reqs[0], MPI_STATUS_IGNORE);
-
-      //reduce then send A to 3
-      remote = 3;
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[0]));
-      err = ompi_request_wait(&send_inter_reqs[0], MPI_STATUS_IGNORE);
-  }
-
-  // Step 4
-  if (0 == rank) {
-      int remote = 1;
-      //recv B from 1
-      err = MCA_PML_CALL(irecv(tmp_buf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[1]));
-      //send D to 1
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[3]));
-      err = ompi_request_wait(&send_intra_reqs[2], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&recv_intra_reqs[0], MPI_STATUS_IGNORE);
-  } else if (3 == rank) {
-      int remote = 2;
-      //recv B from 2
-      err = MCA_PML_CALL(irecv(tmp_buf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[1]));
-      //send D to 2
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[3]));
-      err = ompi_request_wait(&send_intra_reqs[2], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&recv_intra_reqs[0], MPI_STATUS_IGNORE);
-  } else if (1 == rank) {
-      int remote = 0;
-      //recv D from 0
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[3]));
-
-      //recv C from 2
-      remote = 2;
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[2]));
-
-      //reduce then send C to 2
-      remote = 2;
-      err = ompi_request_wait(&recv_intra_reqs[2], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[2]));
-
-      //reduce then send B to 0
-      err = ompi_request_wait(&recv_inter_reqs[1], MPI_STATUS_IGNORE);
-      remote = 0;
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[1]));
-
-      err = ompi_request_wait(&send_intra_reqs[0], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_inter_reqs[1], MPI_STATUS_IGNORE);
-  } else { // 2 == rank
-      int remote = 3;
-      //recv D from 3
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[3]));
-
-      remote = 1;
-      //recv C from 1
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[2]));
-
-      //reduce then send C to 1
-      remote = 1;
-      err = ompi_request_wait(&recv_intra_reqs[2], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[2]));
-
-      //reduce then send B to 3
-      remote = 3;
-      err = ompi_request_wait(&recv_inter_reqs[1], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[1]));
-
-      err = ompi_request_wait(&send_intra_reqs[0], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_inter_reqs[1], MPI_STATUS_IGNORE);
-  }
-
-  // Step 5
-  if (0 == rank) {
-      int remote = 1;
-      //recv C from 1
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[2]));
-
-      err = ompi_request_wait(&recv_intra_reqs[1], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_intra_reqs[3], MPI_STATUS_IGNORE);
-  } else if (3 == rank) {
-      //recv C from 2
-      int remote = 2;
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[2]));
-
-      err = ompi_request_wait(&recv_intra_reqs[1], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_intra_reqs[3], MPI_STATUS_IGNORE);
-  } else if (1 == rank) {
-      //recv D from 2
-      int remote = 2;
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[3]));
-
-      //reduce then send D to 2
-      err = ompi_request_wait(&recv_intra_reqs[3], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[3]));
-
-      //reduce then send C to 0
-      remote = 0;
-      err = ompi_request_wait(&recv_inter_reqs[2], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[2]));
-
-      err = ompi_request_wait(&send_inter_reqs[2], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_intra_reqs[1], MPI_STATUS_IGNORE);
-  } else { // 2 == rank
-      //recv D from 1
-      int remote = 1;
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_inter_reqs[3]));
-
-      //reduce then send D to 1
-      err = ompi_request_wait(&recv_intra_reqs[3], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_inter_reqs[3]));
-
-      //reduce then send C to 3
-      remote = 3;
-      err = ompi_request_wait(&recv_inter_reqs[2], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[2]));
-
-      err = ompi_request_wait(&send_inter_reqs[2], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_intra_reqs[1], MPI_STATUS_IGNORE);
-  }
-
-  // Step 6
-  if (0 == rank) {
-      int remote = 1;
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[3]));
-
-      err = ompi_request_wait(&recv_inter_reqs[2], MPI_STATUS_IGNORE);
-  } else if (3 == rank) {
-      int remote = 2;
-      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER, comm,
-                               &recv_intra_reqs[3]));
-
-      err = ompi_request_wait(&recv_inter_reqs[2], MPI_STATUS_IGNORE);
-  } else if (1 == rank) {
-      int remote = 0;
-      err = ompi_request_wait(&recv_inter_reqs[3], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[3]));
-
-      err = ompi_request_wait(&send_inter_reqs[3], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_intra_reqs[2], MPI_STATUS_IGNORE);
-  } else { // 2 == rank
-      int remote = 3;
-      err = ompi_request_wait(&recv_inter_reqs[3], MPI_STATUS_IGNORE);
-      ompi_op_reduce(op, tmp_buf, rbuf, (count / 4), dtype);
-      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-                               MCA_PML_BASE_SEND_STANDARD, comm,
-                               &send_intra_reqs[3]));
-
-      err = ompi_request_wait(&send_inter_reqs[3], MPI_STATUS_IGNORE);
-      err = ompi_request_wait(&send_intra_reqs[2], MPI_STATUS_IGNORE);
-  }
-
-  // Le Fin
-  if (0 == rank) {
-      err = ompi_request_wait(&recv_intra_reqs[3], MPI_STATUS_IGNORE);
-  } else if (3 == rank) {
-      err = ompi_request_wait(&recv_intra_reqs[3], MPI_STATUS_IGNORE);
-  } else if (1 == rank) {
-      err = ompi_request_wait(&send_intra_reqs[3], MPI_STATUS_IGNORE);
-  } else { // 2 == rank
-      err = ompi_request_wait(&send_intra_reqs[3], MPI_STATUS_IGNORE);
-  }
 
   // Here so that profiler syncronises
   err = comm->c_coll->coll_barrier(comm, comm->c_coll->coll_barrier_module);
