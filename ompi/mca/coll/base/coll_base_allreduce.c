@@ -1485,15 +1485,32 @@ cleanup_and_return:
   return err;
 }
 
+/* copied function (with appropriate renaming) ends here */
 #define INTRA 420
 #define INTER 69
 
-// NUM_CHUNKS >= 4 for this to work
+// NUM_CHUNKS must be >= 4
 #define NUM_CHUNKS 4
+#define NUM_STREAMS NUM_CHUNKS
+#define CHUNK_COUNT(SZ) (SZ / NUM_CHUNKS)
 #define PTR_OFFSET(PTR, IDX, CHUNK_SIZE) \
-                  ((void*) ((char*) PTR + (IDX * CHUNK_SIZE)))
+            ((void*) ((char*) PTR + (IDX * CHUNK_SIZE)))
 
-/* copied function (with appropriate renaming) ends here */
+cudaStream_t pStreams[NUM_STREAMS];
+int stream_idx = 0;
+int initalized = 0;
+
+static inline cudaStream_t get_stream() {
+  if (!initalized) {
+    for (int i=0; i<NUM_STREAMS; i++) {
+      cudaStreamCreate(&pStreams[i]);
+    }
+    initalized = 1;
+  }
+  stream_idx = (stream_idx + 1) % NUM_STREAMS;
+  return pStreams[stream_idx];
+}
+
 int ompi_coll_base_allreduce_intra_yht2(
     const void *sbuf, void *rbuf, int count, struct ompi_datatype_t *dtype,
     struct ompi_op_t *op, struct ompi_communicator_t *comm,
@@ -1517,75 +1534,175 @@ int ompi_coll_base_allreduce_intra_yht2(
 
   ompi_request_t *send_intra_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
   ompi_request_t *recv_intra_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
+
   ompi_request_t *send_inter_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
   ompi_request_t *recv_inter_reqs[NUM_CHUNKS] = {NULL, NULL, NULL, NULL};
 
-  int chunk_count = count / NUM_CHUNKS;
-  ptrdiff_t chunk_size = (count / NUM_CHUNKS) * extent;
+  int chunk_size = (count / NUM_CHUNKS) * extent;
 
-  char *tmp_buf[2];
-
+  char *tmp_buf[2] = {NULL, NULL};
   tmp_buf[0] = isCudaBuffer
              ? (char*) my_cudaMalloc(0, rbuf)
              : (char*) malloc(dsize);
+
   tmp_buf[1] = isCudaBuffer
              ? (char*) my_cudaMalloc(1, rbuf)
              : (char*) malloc(dsize);
 
-  if (NULL == tmp_buf[0] || NULL == tmp_buf[1])
+  if (NULL == tmp_buf[0] || NULL == tmp_buf[1]) {
     return OMPI_ERR_OUT_OF_RESOURCE;
+  }
 
   int err = MPI_SUCCESS;
 
   // Step 1
   int remote;
-  int chunk_idx;
+  int chunk_id;
   if (0 == rank || 3 == rank) {
-      //sending chunks
       remote = 0 == rank ? 1 : 2;
-      chunk_idx = 0;
-      err = MCA_PML_CALL(send(PTR_OFFSET(rbuf, chunk_idx, chunk_size),
-                              chunk_count, dtype, remote,
+      chunk_id = 0;
+      err = MCA_PML_CALL(send(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                              CHUNK_COUNT(count), dtype, remote,
                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
                               MCA_PML_BASE_SEND_STANDARD, comm));
-  }
-
-  if (1 == rank || 2 == rank) {
+  } else { //if (1 == rank || 2 == rank)
       remote = 1 == rank ? 0 : 3;
-      chunk_idx = 0;
+      chunk_id = 0;
+      err = MCA_PML_CALL(irecv(PTR_OFFSET(tmp_buf[1], chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                               comm, &recv_intra_reqs[chunk_id]));
 
-      err = MCA_PML_CALL(recv(PTR_OFFSET(tmp_buf[0], chunk_idx, chunk_size),
-                              chunk_count, dtype, remote,
-                              MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
-                              comm, MPI_STATUS_IGNORE));
+      // This Copy is needed to make the collective faster.
+      // I've notive the buffer denoted rbuf seems to perform better
+      // than the tmp_buf's therefore I am just copying the data and using
+      // rbuf as a temp buffer.
+      // As for why this works? I really dont know but this h4xx0r fix works.
+      cudaStream_t stream = get_stream();
+      cudaMemcpyAsync(tmp_buf[0], rbuf, count * extent,
+                      cudaMemcpyDeviceToDevice, stream);
 
-      /* rbuf = tmp_buf[0] (op) rbuf */
+      err = ompi_request_wait(&recv_intra_reqs[chunk_id], MPI_STATUS_IGNORE);
+      cudaStreamSynchronize(stream);
+
+      // Which order? Assume Kerenel copies into both buffers.
       ompi_op_reduce(op,
-                     PTR_OFFSET(tmp_buf[0], chunk_idx, chunk_size),
-                     PTR_OFFSET(rbuf, chunk_idx, chunk_size),
-                     count, dtype);
+                     PTR_OFFSET(tmp_buf[1], chunk_id, chunk_size),
+                     PTR_OFFSET(tmp_buf[0], chunk_id, chunk_size),
+                     CHUNK_COUNT(count), dtype);
   }
 
-//      // Recive inter socket
-//      remote = 1 == rank ? 2 : 1;
-//      err = MCA_PML_CALL(irecv(rbuf, (count / 4), dtype, remote,
-//                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-//                               comm, &recv_inter_reqs[i]));
-//
-//      remote = 1 == rank ? 2 : 1;
-//      err = MCA_PML_CALL(isend(rbuf, (count / 4), dtype, remote,
-//                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
-//                               MCA_PML_BASE_SEND_STANDARD, comm,
-//                               &send_inter_reqs[i]));
-//
-//
-//  for (int i=0; i<4; i++) {
-//      if (1 == rank || 2 == rank) {
-//          err = ompi_request_wait(&send_inter_reqs[i], MPI_STATUS_IGNORE);
-//          err = ompi_request_wait(&recv_inter_reqs[i], MPI_STATUS_IGNORE);
-//      }
-//  }
+  // Step 2
 
+  if (0 == rank || 3 == rank) {
+      remote = 0 == rank ? 1 : 2;
+      chunk_id = 1;
+      err = MCA_PML_CALL(send(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                              CHUNK_COUNT(count), dtype, remote,
+                              MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                              MCA_PML_BASE_SEND_STANDARD, comm));
+  } else { //if (1 == rank || 2 == rank)
+      // Post Inter recv
+      remote = 1 == rank ? 2 : 1;
+      chunk_id = 0;
+      err = MCA_PML_CALL(irecv(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
+                               comm, &recv_inter_reqs[chunk_id]));
+
+      // Sent Inter socket
+      err = MCA_PML_CALL(isend(PTR_OFFSET(tmp_buf[0], chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
+                               MCA_PML_BASE_SEND_STANDARD, comm,
+                               &send_inter_reqs[chunk_id]));
+
+      // Recv Next Intra Chunk
+      remote = 1 == rank ? 0 : 3;
+      chunk_id = 1;
+      err = MCA_PML_CALL(irecv(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                               comm, &recv_intra_reqs[chunk_id]));
+  }
+
+  // Step 3
+  if (0 == rank || 3 == rank) {
+      remote = 0 == rank ? 1 : 2;
+
+      // Recive Final Reduced Value
+      chunk_id = 0;
+      err = MCA_PML_CALL(irecv(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                               comm, &recv_intra_reqs[chunk_id]));
+
+      // Send next chunk
+      chunk_id = 2;
+      err = MCA_PML_CALL(send(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                              CHUNK_COUNT(count), dtype, remote,
+                              MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                              MCA_PML_BASE_SEND_STANDARD, comm));
+
+      // Wait for Final Reduced Value
+      chunk_id = 0;
+      err = ompi_request_wait(&recv_intra_reqs[chunk_id], MPI_STATUS_IGNORE);
+  } else { // if (1 == rank || 2 == rank)
+      remote = 1 == rank ? 0 : 3;
+      chunk_id = 2;
+      err = MCA_PML_CALL(irecv(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                               comm, &recv_intra_reqs[chunk_id]));
+
+      remote = 1 == rank ? 2 : 1;
+      chunk_id = 1;
+      err = MCA_PML_CALL(irecv(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
+                               comm, &recv_inter_reqs[chunk_id]));
+
+      // moved down from line 1660
+      err = ompi_request_wait(&recv_intra_reqs[1], MPI_STATUS_IGNORE);
+      // Must wait for send to be complete before next inter-socket transfer
+      err = ompi_request_wait(&send_inter_reqs[0], MPI_STATUS_IGNORE);
+      remote = 1 == rank ? 2 : 1;
+      chunk_id = 1;
+      // Which order? Assume Kerenel copies into both buffers.
+      ompi_op_reduce(op,
+                     PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                     PTR_OFFSET(tmp_buf[0], chunk_id, chunk_size),
+                     CHUNK_COUNT(count), dtype);
+      err = MCA_PML_CALL(isend(PTR_OFFSET(tmp_buf[0], chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
+                               MCA_PML_BASE_SEND_STANDARD,
+                               comm, &send_inter_reqs[chunk_id]));
+
+
+      err = ompi_request_wait(&recv_inter_reqs[0], MPI_STATUS_IGNORE);
+      // Reduces probs
+      chunk_id = 0;
+      remote = 1 == rank ? 0 : 3;
+      ompi_op_reduce(op,
+                     PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                     PTR_OFFSET(tmp_buf[0], chunk_id, chunk_size),
+                     CHUNK_COUNT(count), dtype);
+      err = MCA_PML_CALL(isend(PTR_OFFSET(rbuf, chunk_id, chunk_size),
+                               CHUNK_COUNT(count), dtype, remote,
+                               MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                               MCA_PML_BASE_SEND_STANDARD,
+                               comm, &send_intra_reqs[chunk_id]));
+  }
+
+  // Step 4
+  if (1 == rank || 2 == rank) {
+      err = ompi_request_wait(&recv_intra_reqs[2], MPI_STATUS_IGNORE);
+      err = ompi_request_wait(&send_intra_reqs[0], MPI_STATUS_IGNORE);
+
+      err = ompi_request_wait(&recv_inter_reqs[1], MPI_STATUS_IGNORE);
+      err = ompi_request_wait(&send_inter_reqs[1], MPI_STATUS_IGNORE);
+  }
 
   // Here so that profiler syncronises
   err = comm->c_coll->coll_barrier(comm, comm->c_coll->coll_barrier_module);
