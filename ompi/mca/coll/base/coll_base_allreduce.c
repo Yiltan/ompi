@@ -1486,29 +1486,34 @@ cleanup_and_return:
 }
 
 /* copied function (with appropriate renaming) ends here */
-#define INTRA 420
-#define INTER 69
+#define INTRA -420
+#define INTER -69
+#define MC -123
 
-// NUM_CHUNKS must be >= 4
-#define NUM_CHUNKS 8
-#define NUM_STREAMS NUM_CHUNKS
-#define CHUNK_COUNT(SZ) (SZ / NUM_CHUNKS)
-#define PTR_OFFSET(PTR, IDX, CHUNK_SIZE) \
-            ((void*) ((char*) PTR + (IDX * CHUNK_SIZE)))
+int num_chunks = 0;
 
-cudaStream_t pStreams[NUM_STREAMS];
-int stream_idx = 0;
-int initalized = 0;
-
-static inline cudaStream_t get_stream() {
-  if (!initalized) {
-    for (int i=0; i<NUM_STREAMS; i++) {
-      cudaStreamCreate(&pStreams[i]);
-    }
-    initalized = 1;
+static int get_num_chunks(int sz) {
+  if (sz <= 4 * 1024 * 1024) {
+      return 2;
   }
-  stream_idx = (stream_idx + 1) % NUM_STREAMS;
-  return pStreams[stream_idx];
+
+  if (sz <= 16 * 1024 * 1024) {
+      return 4;
+  }
+
+  if (sz <= 64 * 1024 * 1024) {
+      return 8;
+  }
+
+  return 16;
+}
+
+static inline int get_chunk_count(int count, int msg_size) {
+  return (count/ get_num_chunks(msg_size));
+}
+
+static inline void* ptr_offset(void *ptr, int idx, int chunk_size) {
+  return ((void*) ((char*) ptr + (idx * chunk_size)));
 }
 
 #define DEBUG_BUFFER
@@ -1534,12 +1539,26 @@ static inline void print_buffers(float *A, float *B, int n, int rank) {
 #endif // DEBUG_BUFFER
 }
 
+static inline int upper_power_of_two(int v)
+{
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  //v |= v >> 32;
+  v++;
+  return v;
+}
+
 int ompi_coll_base_allreduce_intra_yht2(
     const void *sbuf, void *rbuf, int count, struct ompi_datatype_t *dtype,
     struct ompi_op_t *op, struct ompi_communicator_t *comm,
     mca_coll_base_module_t *module)
 {
   if (MPI_IN_PLACE != sbuf) {
+      printf("Inside the %s\n", __func__);
       return -1; // MPI_ERROR?
   }
 
@@ -1555,21 +1574,32 @@ int ompi_coll_base_allreduce_intra_yht2(
   ompi_datatype_get_extent(dtype, &lb, &extent);
   dsize = opal_datatype_span(&dtype->super, count, &gap);
 
-  ompi_request_t *send_intra_reqs[NUM_CHUNKS] = {NULL};//, NULL, NULL, NULL};
-  ompi_request_t *recv_intra_reqs[NUM_CHUNKS] = {NULL};//, NULL, NULL, NULL};
-  ompi_request_t *send_inter_reqs[NUM_CHUNKS] = {NULL};//, NULL, NULL, NULL};
-  ompi_request_t *recv_inter_reqs[NUM_CHUNKS] = {NULL};//, NULL, NULL, NULL};
+  ompi_request_t *send_intra_reqs[16] = {NULL};
+  ompi_request_t *recv_intra_reqs[16] = {NULL};
+  ompi_request_t *send_inter_reqs[16] = {NULL};
+  ompi_request_t *recv_inter_reqs[16] = {NULL};
 
-  int chunk_size = (count / NUM_CHUNKS) * extent;
+  size_t orig_msg_size = count * extent;
+  //size_t msg_size = upper_power_of_two(count) * extent;
+  size_t msg_size = (count) * extent;
+
+  int num_chunks = get_num_chunks(msg_size);
+
+  int chunk_size = msg_size / num_chunks;
+  //int chunk_count = get_chunk_count(upper_power_of_two(count), msg_size);
+  int chunk_count = get_chunk_count((count), msg_size);
+
+  int last_chunk = num_chunks - 1;
+  int last_count = (num_chunks * chunk_count) - count;
 
   char *tmp_buf[2] = {NULL, NULL};
   tmp_buf[0] = isCudaBuffer
-    ? (char*) my_cudaMalloc(0, rbuf)
-    : (char*) malloc(dsize);
+             ? (char*) my_cudaMalloc(0, rbuf)
+             : (char*) malloc(dsize);
 
   tmp_buf[1] = isCudaBuffer
-    ? (char*) my_cudaMalloc(1, rbuf)
-    : (char*) malloc(dsize);
+             ? (char*) my_cudaMalloc(1, rbuf)
+             : (char*) malloc(dsize);
 
   if (NULL == tmp_buf[0] || NULL == tmp_buf[1]) {
       return OMPI_ERR_OUT_OF_RESOURCE;
@@ -1578,21 +1608,30 @@ int ompi_coll_base_allreduce_intra_yht2(
   int err = MPI_SUCCESS;
   int remote = -1;
 
+
   // Phase 1
-  for (int i=0; i<NUM_CHUNKS; i++) {
+  for (int i=0; i<num_chunks; i++) {
+      int tag = 0 == i
+              ?  MCA_COLL_BASE_TAG_ALLREDUCE + INTRA + MC
+              : MCA_COLL_BASE_TAG_ALLREDUCE + INTRA;
+
       if (0 == rank || 3 == rank) {
           remote = 0 == rank ? 1 : 2;
-          err = MCA_PML_CALL(isend(PTR_OFFSET(rbuf, i, chunk_size),
-                                   CHUNK_COUNT(count), dtype, remote,
-                                   MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+
+
+          err = MCA_PML_CALL(isend(ptr_offset(rbuf, i, chunk_size),
+                                   chunk_count,
+                                   dtype, remote,
+                                   tag,
                                    MCA_PML_BASE_SEND_STANDARD,
                                    comm, &send_intra_reqs[i]));
 
       } else { //if (1 == rank || 2 == rank)
           remote = 1 == rank ? 0 : 3;
-          err = MCA_PML_CALL(irecv(PTR_OFFSET(tmp_buf[0], i, chunk_size),
-                                   CHUNK_COUNT(count), dtype, remote,
-                                   MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+          err = MCA_PML_CALL(irecv(ptr_offset(tmp_buf[0], i, chunk_size),
+                                   chunk_count,
+                                   dtype, remote,
+                                   tag,
                                    comm, &recv_intra_reqs[i]));
       }
   }
@@ -1600,17 +1639,24 @@ int ompi_coll_base_allreduce_intra_yht2(
   // Recvs for phase 2 and 3 can be posted early.
   // This is required for the CUDA IPC registration.
   // Data will be sent as required
-  for (int i=0; i<NUM_CHUNKS; i++) {
+  for (int i=0; i<num_chunks; i++) {
       if (0 == rank || 3 == rank) {
           remote = 0 == rank ? 1 : 2;
-          err = MCA_PML_CALL(irecv(PTR_OFFSET(rbuf, i, chunk_size),
-                                   CHUNK_COUNT(count), dtype, remote,
-                                   MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+
+          int tag = num_chunks - 1 == i
+                  ?  MCA_COLL_BASE_TAG_ALLREDUCE + INTRA + MC
+                  : MCA_COLL_BASE_TAG_ALLREDUCE + INTRA;
+
+          err = MCA_PML_CALL(irecv(ptr_offset(rbuf, i, chunk_size),
+                                   chunk_count,
+                                   dtype, remote,
+                                   tag,
                                    comm, &recv_intra_reqs[i]));
       } else { //if (1 == rank || 2 == rank)
           remote = 1 == rank ? 2 : 1;
-          err = MCA_PML_CALL(irecv(PTR_OFFSET(rbuf, i, chunk_size),
-                                   CHUNK_COUNT(count), dtype, remote,
+          err = MCA_PML_CALL(irecv(ptr_offset(rbuf, i, chunk_size),
+                                   chunk_count,
+                                   dtype, remote,
                                    MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
                                    comm, &recv_inter_reqs[i]));
       }
@@ -1626,21 +1672,24 @@ int ompi_coll_base_allreduce_intra_yht2(
   int phase_3_cmplt = 0;
 
   if (1 == rank || 2 == rank) {
-      while ((NUM_CHUNKS > num_phase_2) || (NUM_CHUNKS > num_phase_3)) {
-          if (NUM_CHUNKS > num_phase_2) {
-              ompi_request_test_any(NUM_CHUNKS, recv_intra_reqs, &phase_2_idx,
+      while ((num_chunks > num_phase_2) || (num_chunks > num_phase_3)) {
+          if (num_chunks > num_phase_2) {
+              ompi_request_test_any(num_chunks, recv_intra_reqs, &phase_2_idx,
                                     &phase_2_cmplt, MPI_STATUSES_IGNORE);
 
               if (1 == phase_2_cmplt) {
                   // One of the chunks has completed
                   ompi_op_reduce(op,
-                                 PTR_OFFSET(tmp_buf[0], phase_2_idx, chunk_size),
-                                 PTR_OFFSET(rbuf, phase_2_idx, chunk_size),
-                                 CHUNK_COUNT(count), dtype);
+                                 ptr_offset(tmp_buf[0], phase_2_idx, chunk_size),
+                                 ptr_offset(rbuf, phase_2_idx, chunk_size),
+                                 chunk_count,
+                                 dtype);
+
 
                   remote = 1 == rank ? 2 : 1;
-                  err = MCA_PML_CALL(isend(PTR_OFFSET(tmp_buf[0], phase_2_idx, chunk_size),
-                                           CHUNK_COUNT(count), dtype, remote,
+                  err = MCA_PML_CALL(isend(ptr_offset(tmp_buf[0], phase_2_idx, chunk_size),
+                                           chunk_count,
+                                           dtype, remote,
                                            MCA_COLL_BASE_TAG_ALLREDUCE + INTER,
                                            MCA_PML_BASE_SEND_STANDARD,
                                            comm, &send_inter_reqs[phase_2_idx]));
@@ -1651,21 +1700,27 @@ int ompi_coll_base_allreduce_intra_yht2(
               }
           }
 
-          if (NUM_CHUNKS > num_phase_3) {
-              ompi_request_test_any(NUM_CHUNKS, recv_inter_reqs, &phase_3_idx,
+          if (num_chunks > num_phase_3) {
+              ompi_request_test_any(num_chunks, recv_inter_reqs, &phase_3_idx,
                                     &phase_3_cmplt, MPI_STATUSES_IGNORE);
 
               if (1 == phase_3_cmplt) {
                   // One of the chunks has completed
                   remote = 1 == rank ? 0 : 3;
                   ompi_op_reduce(op,
-                                 PTR_OFFSET(tmp_buf[0], phase_3_idx, chunk_size),
-                                 PTR_OFFSET(rbuf, phase_3_idx, chunk_size),
-                                 CHUNK_COUNT(count), dtype);
+                                 ptr_offset(tmp_buf[0], phase_3_idx, chunk_size),
+                                 ptr_offset(rbuf, phase_3_idx, chunk_size),
+                                 chunk_count,
+                                 dtype);
 
-                  err = MCA_PML_CALL(isend(PTR_OFFSET(tmp_buf[0], phase_3_idx, chunk_size),
-                                           CHUNK_COUNT(count), dtype, remote,
-                                           MCA_COLL_BASE_TAG_ALLREDUCE + INTRA,
+                  int tag = num_chunks == num_phase_3 + 1
+                          ? MCA_COLL_BASE_TAG_ALLREDUCE + INTRA + MC
+                          : MCA_COLL_BASE_TAG_ALLREDUCE + INTRA;
+
+                  err = MCA_PML_CALL(isend(ptr_offset(tmp_buf[0], phase_3_idx, chunk_size),
+                                           chunk_count,
+                                           dtype, remote,
+                                           tag,
                                            MCA_PML_BASE_SEND_STANDARD,
                                            comm, &send_intra_reqs[phase_3_idx]));
 
@@ -1680,7 +1735,7 @@ int ompi_coll_base_allreduce_intra_yht2(
   }
 
   // Final Wait
-  for (int i=0; i<NUM_CHUNKS; i++) {
+  for (int i=0; i<num_chunks; i++) {
       if (0 == rank || 3 == rank) {
           err = ompi_request_wait(&send_intra_reqs[i], MPI_STATUS_IGNORE);
 
@@ -1696,7 +1751,7 @@ int ompi_coll_base_allreduce_intra_yht2(
   }
 
   // Here so that profiler syncronises
-  err = comm->c_coll->coll_barrier(comm, comm->c_coll->coll_barrier_module);
+  //err = comm->c_coll->coll_barrier(comm, comm->c_coll->coll_barrier_module);
 
   if (MPI_SUCCESS != err) { goto cleanup_and_return; }
 
@@ -1704,4 +1759,3 @@ cleanup_and_return:
   return err;
 }
 
-/* copied function (with appropriate renaming) ends here */
