@@ -161,7 +161,7 @@ ompi_coll_base_allreduce_intra_recursivedoubling(const void *sbuf, void *rbuf,
     /* Allocate and initialize temporary send buffer */
     span = opal_datatype_span(&dtype->super, count, &gap);
     inplacebuf_free = isCudaBuffer
-                    ? my_cudaMalloc(0, rbuf)
+                    ? my_cudaMalloc(0)
                     : (char*) malloc(span);
     if (NULL == inplacebuf_free) { ret = -1; line = __LINE__; goto error_hndl; }
     inplacebuf = inplacebuf_free - gap;
@@ -410,12 +410,12 @@ ompi_coll_base_allreduce_intra_ring(const void *sbuf, void *rbuf, int count,
 
 
     inbuf[0] = isCudaBuffer
-             ? my_cudaMalloc(0, rbuf)
+             ? my_cudaMalloc(0)
              : (char*)malloc(max_real_segsize);
     if (NULL == inbuf[0]) { ret = -1; line = __LINE__; goto error_hndl; }
     if (size > 2) {
       inbuf[1] = isCudaBuffer
-               ? my_cudaMalloc(1, rbuf)
+               ? my_cudaMalloc(1)
                : (char*)malloc(max_real_segsize);
         if (NULL == inbuf[1]) { ret = -1; line = __LINE__; goto error_hndl; }
     }
@@ -713,12 +713,12 @@ ompi_coll_base_allreduce_intra_ring_segmented(const void *sbuf, void *rbuf, int 
 
     /* Allocate and initialize temporary buffers */
     inbuf[0] = isCudaBuffer
-             ? my_cudaMalloc(0, rbuf)
+             ? my_cudaMalloc(0)
              : (char*)malloc(max_real_segsize);
     if (NULL == inbuf[0]) { ret = -1; line = __LINE__; goto error_hndl; }
     if (size > 2) {
         inbuf[1] = isCudaBuffer
-                 ? my_cudaMalloc(1, rbuf)
+                 ? my_cudaMalloc(1)
                  : (char*)malloc(max_real_segsize);
         if (NULL == inbuf[1]) { ret = -1; line = __LINE__; goto error_hndl; }
     }
@@ -1033,7 +1033,7 @@ int ompi_coll_base_allreduce_intra_redscat_allgather(
     /* Temporary buffer for receiving messages */
     char *tmp_buf = NULL;
     char *tmp_buf_raw = isCudaBuffer
-                      ? (char*) my_cudaMalloc(0, rbuf)
+                      ? (char*) my_cudaMalloc(0)
                       : (char*) malloc(dsize);
     if (NULL == tmp_buf_raw)
         return OMPI_ERR_OUT_OF_RESOURCE;
@@ -1334,7 +1334,7 @@ int ompi_coll_base_allreduce_intra_yht(
   ptrdiff_t chunk_size = (count / 4) * extent;
 
   char *tmp_buf = isCudaBuffer
-    ? (char*) my_cudaMalloc(0, rbuf)
+    ? (char*) my_cudaMalloc(0)
     : (char*) malloc(dsize);
 
   if (NULL == tmp_buf)
@@ -1594,11 +1594,11 @@ int ompi_coll_base_allreduce_intra_yht2(
 
   char *tmp_buf[2] = {NULL, NULL};
   tmp_buf[0] = isCudaBuffer
-             ? (char*) my_cudaMalloc(0, rbuf)
+             ? (char*) my_cudaMalloc(0)
              : (char*) malloc(dsize);
 
   tmp_buf[1] = isCudaBuffer
-             ? (char*) my_cudaMalloc(1, rbuf)
+             ? (char*) my_cudaMalloc(1)
              : (char*) malloc(dsize);
 
   if (NULL == tmp_buf[0] || NULL == tmp_buf[1]) {

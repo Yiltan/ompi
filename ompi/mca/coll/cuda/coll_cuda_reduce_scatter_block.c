@@ -18,19 +18,20 @@
 #include "ompi/op/op.h"
 #include "opal/datatype/opal_convertor.h"
 #include "opal/datatype/opal_datatype_cuda.h"
-//int ucx_aware_status = -1;
-//static inline int is_ucx_aware() {
-//  if (ucx_aware_status == -1) {
-//    char* env = getenv("IS_UCX_AWARE");
-//
-//    if (NULL == env) {
-//      *env = '0';
-//    }
-//
-//    ucx_aware_status = atoi(env);
-//  }
-//  return ucx_aware_status;
-//}
+
+static int ucx_aware_status = -1;
+static inline int is_ucx_aware() {
+  if (ucx_aware_status == -1) {
+    char* env = getenv("IS_UCX_AWARE");
+
+    if (NULL == env) {
+      *env = '0';
+    }
+
+    ucx_aware_status = atoi(env);
+  }
+  return ucx_aware_status;
+}
 //
 //
 //  if (is_ucx_aware() && OMPI_OP_SUM == op->op_type) {
@@ -67,6 +68,11 @@ mca_coll_cuda_reduce_scatter_block(const void *sbuf, void *rbuf, int rcount,
     rbufsize = opal_datatype_span(&dtype->super, rcount, &gap);
 
     sbufsize = rbufsize * ompi_comm_size(comm);
+
+  if (is_ucx_aware() && OMPI_OP_SUM == op->op_type) {
+      return s->c_coll.coll_reduce_scatter_block(sbuf, rbuf, rcount, dtype, op, comm,
+      s->c_coll.coll_reduce_scatter_block_module);
+  }
 
     if ((MPI_IN_PLACE != sbuf) && (opal_cuda_check_bufs((char *)sbuf, NULL))) {
         sbuf1 = (char*)malloc(sbufsize);

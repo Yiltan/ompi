@@ -130,6 +130,7 @@ static inline void init_comms(struct ompi_communicator_t* original_comm) {
 #define ALLREDUCE_INTRA_BASIC_LINEAR      4
 #define ALLREDUCE_INTRA_REDSCAT_ALLGATHER 5
 #define ALLREDUCE_INTRA_YHT               6
+#define ALLREDUCE_INTRA_YHT2              7
 
 int allreduce_switch(const void *sbuf, void *rbuf, int count,
                      struct ompi_datatype_t *dtype,
@@ -163,8 +164,10 @@ int allreduce_switch(const void *sbuf, void *rbuf, int count,
                                                               dtype, op, comm, module);
       break;
     case ALLREDUCE_INTRA_YHT:
-    default:
       return ompi_coll_base_allreduce_intra_yht(sbuf, rbuf, count, dtype, op, comm, module);
+    case ALLREDUCE_INTRA_YHT2:
+    default:
+      return ompi_coll_base_allreduce_intra_yht2(sbuf, rbuf, count, dtype, op, comm, module);
       break;
   }
 }
@@ -256,6 +259,12 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
     ompi_datatype_type_size(dtype, &dsize);
     block_dsize = dsize * (ptrdiff_t)count;
 
+
+//    if (isCudaBuffer) {
+//        printf("CUDA [%d], MPI_INPLACE [%d], COUNT [%d], DSIZE [%dB], SIZE [%dB]\n",
+//               isCudaBuffer, is_in_place, count, dsize, (count * dsize));
+//    }
+
     // If single node (assuming 4 PPN) or using a flat algo
     // then use original algo.
     // This can be optimized later for single node if needed.
@@ -294,41 +303,46 @@ ompi_coll_tuned_allreduce_intra_dec_fixed(const void *sbuf, void *rbuf, int coun
         ret_val &= (allreduce_switch(MPI_IN_PLACE, rbuf, count, dtype, op,
                                      intra_comm, module, segment_size, intra_allreduce_algo));
         return ret_val;
-    } else if (2 == use_hierarchical_allreduce) {
-        // 3 stage algo
-        int segsize = 1024;
-        int ret_val = MPI_SUCCESS;
-
-        if (MPI_IN_PLACE == sbuf) {
-            ret_val &= (ompi_coll_tuned_reduce_intra_dec_fixed(rbuf, rbuf, count,
-                                                               dtype, op, 0,
-                                                               intra_comm, module));
-        }
-        else {
-            ret_val &= (ompi_coll_tuned_reduce_intra_dec_fixed(sbuf, rbuf, count,
-                                                               dtype, op, 0,
-                                                               intra_comm, module));
-        }
-
-        if (0 == ompi_comm_rank(intra_comm)) {
-          ret_val &= (allreduce_switch(MPI_IN_PLACE, rbuf, count, dtype, op,
-                                       inter_comm, module, segment_size,
-                                       inter_algo));
-        }
-
-        ret_val &= (ompi_coll_tuned_bcast_intra_dec_fixed(rbuf, count, dtype, 0,
-                                                          intra_comm, module));
-        return ret_val;
     } else if (3 == use_hierarchical_allreduce) {
         // Flat algo
         return (allreduce_switch(sbuf, rbuf, count, dtype, op,
                                  comm, module, segment_size,
                                  intra_allreduce_algo));
-    } else if (4 == use_hierarchical_allreduce) {
-        // Flat algo
-        return (allreduce_switch(sbuf, rbuf, count, dtype, op,
-                                 intra_comm, module, segment_size,
-                                 intra_allreduce_algo));
+    } else if (5 == use_hierarchical_allreduce) {
+        int isCudaBuffer = opal_cuda_check_bufs((char *) sbuf, (char *) rbuf);
+        int is_in_place = MPI_IN_PLACE == sbuf;
+        int is_large_message = (dsize * count) > (256 * 1024);
+
+        if (isCudaBuffer && is_in_place && is_large_message) {
+            // USE new algo
+            return ompi_coll_base_allreduce_intra_yht2(sbuf, rbuf, count, dtype,
+                                                       op, comm, module);
+        } else {
+            if (block_dsize < intermediate_message) {
+                return (ompi_coll_base_allreduce_intra_recursivedoubling(sbuf, rbuf,
+                                                                         count, dtype,
+                                                                         op, comm,
+                                                                         module));
+            }
+
+            if( ompi_op_is_commute(op) && (count > comm_size) ) {
+                if (((size_t)comm_size * (size_t)segment_size >= block_dsize)) {
+                    return (ompi_coll_base_allreduce_intra_ring(sbuf, rbuf, count,
+                                                                dtype, op, comm,
+                                                                module));
+                } else {
+                    return (ompi_coll_base_allreduce_intra_ring_segmented(sbuf, rbuf,
+                                                                          count, dtype,
+                                                                          op, comm,
+                                                                          module,
+                                                                          segment_size));
+                }
+            }
+
+            return (ompi_coll_base_allreduce_intra_nonoverlapping(sbuf, rbuf, count,
+                                                                  dtype, op, comm,
+                                                                  module));
+        }
     } else {
         return -1;
     }
